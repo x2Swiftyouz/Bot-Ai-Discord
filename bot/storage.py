@@ -39,6 +39,14 @@ CREATE TABLE IF NOT EXISTS usage (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_day_user ON usage (day, user_id);
 
+CREATE TABLE IF NOT EXISTS user_notes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    note       TEXT    NOT NULL,
+    created_at REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_notes_user ON user_notes (user_id, id);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -86,6 +94,38 @@ class Database:
     def delete_setting(self, key: str) -> None:
         self.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
         self.conn.commit()
+
+    # ---------- user notes (/remember: ข้อมูลส่วนตัวที่ผู้ใช้ขอให้บอทจำ ใช้ได้ทุกห้อง) ----------
+
+    def add_note(self, user_id: int, note: str) -> None:
+        self.conn.execute(
+            "INSERT INTO user_notes (user_id, note, created_at) VALUES (?, ?, ?)",
+            (user_id, note, time.time()),
+        )
+        self.conn.commit()
+
+    def notes(self, user_id: int) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT note FROM user_notes WHERE user_id = ? ORDER BY id", (user_id,)
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def delete_note(self, user_id: int, index: int) -> str | None:
+        """ลบข้อที่ index (เริ่มที่ 1) คืนข้อความที่ลบ หรือ None ถ้าไม่มี"""
+        rows = self.conn.execute(
+            "SELECT id, note FROM user_notes WHERE user_id = ? ORDER BY id", (user_id,)
+        ).fetchall()
+        if not 1 <= index <= len(rows):
+            return None
+        row_id, note = rows[index - 1]
+        self.conn.execute("DELETE FROM user_notes WHERE id = ?", (row_id,))
+        self.conn.commit()
+        return note
+
+    def clear_notes(self, user_id: int) -> int:
+        cur = self.conn.execute("DELETE FROM user_notes WHERE user_id = ?", (user_id,))
+        self.conn.commit()
+        return cur.rowcount
 
     # ---------- usage ----------
 

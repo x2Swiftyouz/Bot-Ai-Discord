@@ -41,6 +41,8 @@ class ImageData:
 
 # บุคลิกของห้องที่กำลังตอบ (/persona) — ตั้งโดยบอทก่อนเรียก AI แทนที่ SYSTEM_PROMPT
 CURRENT_PERSONA: ContextVar[str | None] = ContextVar("CURRENT_PERSONA", default=None)
+# ข้อมูลที่ผู้ถามขอให้จำไว้ (/remember) — ต่อท้าย system prompt ของคำถามนั้น
+CURRENT_USER_NOTES: ContextVar[str | None] = ContextVar("CURRENT_USER_NOTES", default=None)
 
 # รับ "ข้อความทั้งหมดที่ได้มาถึงตอนนี้" ระหว่าง streaming (ใช้แสดงคำตอบค่อย ๆ พิมพ์)
 OnDelta = Callable[[str], None]
@@ -267,7 +269,8 @@ class AIProvider(ABC):
         """system prompt + วันเวลาปัจจุบัน (AI ไม่รู้วันที่เองจึงคำนวณระยะเวลาผิดถ้าไม่บอก)"""
         now = f"ข้อมูลอ้างอิง: ตอนนี้คือ{now_text(self.timezone)} ใช้ข้อมูลนี้เมื่อต้องคำนวณวันเวลา"
         base = CURRENT_PERSONA.get() or self.system_prompt
-        return f"{base}\n\n{now}" if base else now
+        parts = [p for p in (base, now, CURRENT_USER_NOTES.get()) if p]
+        return "\n\n".join(parts)
 
     async def generate(
         self,

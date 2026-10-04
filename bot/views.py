@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -53,11 +54,21 @@ class AnswerView(discord.ui.View):
     def refresh(self) -> None:
         """คำตอบที่ error จะเหลือแค่ปุ่ม "ลองใหม่" กับ "ลบ" """
         self.regenerate.label = "ตอบใหม่" if self.ctx.ok else "ลองใหม่"
+        # แปลไปอีกภาษา: คำตอบเป็นไทย → อังกฤษ, ไม่ใช่ไทย → ไทย
+        self.translate.label = "แปลอังกฤษ" if self.answer_is_thai else "แปลไทย"
         self.clear_items()
         self.add_item(self.regenerate)
         if self.ctx.ok:
             self.add_item(self.continue_)
         self.add_item(self.delete)
+        if self.ctx.ok:
+            # แถวที่ 2: ปุ่มคำถามแนะนำ ปรับคำตอบได้ในคลิกเดียว
+            for item in (self.shorter, self.detail, self.translate):
+                self.add_item(item)
+
+    @property
+    def answer_is_thai(self) -> bool:
+        return bool(re.search(r"[\u0E00-\u0E7F]", self.ctx.answer))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         user = interaction.user
@@ -96,14 +107,28 @@ class AnswerView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-    @discord.ui.button(label="ตอบใหม่", emoji="🔄", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="ตอบใหม่", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
     async def regenerate(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self.bot.regenerate_answer(interaction, self)
 
-    @discord.ui.button(label="เขียนต่อ", emoji="➡️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="เขียนต่อ", emoji="➡️", style=discord.ButtonStyle.secondary, row=0)
     async def continue_(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self.bot.continue_answer(interaction, self)
+        await self.bot.followup_answer(interaction, self, "continue")
 
-    @discord.ui.button(label="ลบ", emoji="🗑️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="ลบ", emoji="🗑️", style=discord.ButtonStyle.secondary, row=0)
     async def delete(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self.bot.delete_answer(interaction, self)
+
+    @discord.ui.button(label="สั้นลง", emoji="📝", style=discord.ButtonStyle.secondary, row=1)
+    async def shorter(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.bot.followup_answer(interaction, self, "shorter")
+
+    @discord.ui.button(label="ละเอียดขึ้น", emoji="📖", style=discord.ButtonStyle.secondary, row=1)
+    async def detail(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.bot.followup_answer(interaction, self, "detail")
+
+    @discord.ui.button(label="แปลอังกฤษ", emoji="🌐", style=discord.ButtonStyle.secondary, row=1)
+    async def translate(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.bot.followup_answer(
+            interaction, self, "to_english" if self.answer_is_thai else "to_thai"
+        )

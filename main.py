@@ -28,7 +28,7 @@ from bot.cooldown import UserCooldown
 from bot.media import is_image, read_images
 from bot.memory import ChannelMemory
 from bot.providers import (
-    CURRENT_PERSONA, AIError, AIProvider, BackupProvider, ImageData, OnDelta, create_provider,
+    CURRENT_PERSONA, CURRENT_USER_NOTES, AIError, AIProvider, BackupProvider, ImageData, OnDelta, create_provider,
 )
 from bot.search import SearchError, TavilySearch, format_results, should_search
 from bot.storage import Database
@@ -70,6 +70,13 @@ IMAGE_ONLY_QUESTION = "ช่วยอธิบายรูปนี้หน่
 REPLY_ONLY_QUESTION = "ช่วยอธิบายหรือตอบข้อความนี้หน่อย"
 MAX_SOURCES = 3
 CONTINUE_QUESTION = "เขียนต่อจากคำตอบก่อนหน้าให้จบ ต่อจากจุดที่ค้างไว้เลย ไม่ต้องทวนซ้ำ"
+# ปุ่มคำถามแนะนำ: ชนิด -> (ป้ายบอกในคำตอบ, คำสั่งให้ AI) — ส่งคำตอบเดิมไปด้วย ไม่พึ่งความจำของห้อง
+FOLLOWUPS = {
+    "shorter": ("📝 สั้นลง", "สรุปข้อความด้านล่างให้สั้นลงมาก เหลือแต่ใจความสำคัญ คงภาษาเดิม"),
+    "detail": ("📖 ละเอียดขึ้น", "อธิบายข้อความด้านล่างให้ละเอียดขึ้น เพิ่มตัวอย่างหรือรายละเอียดที่เป็นประโยชน์ คงภาษาเดิม"),
+    "to_english": ("🌐 แปลอังกฤษ", "แปลข้อความด้านล่างเป็นภาษาอังกฤษให้เป็นธรรมชาติ ตอบเฉพาะคำแปล"),
+    "to_thai": ("🌐 แปลไทย", "แปลข้อความด้านล่างเป็นภาษาไทยให้เป็นธรรมชาติ ตอบเฉพาะคำแปล"),
+}
 # เมนูคลิกขวาที่ข้อความ: ชื่อเมนู -> (ป้ายบอกในผลลัพธ์, คำสั่งให้ AI)
 MESSAGE_ACTIONS = {
     "translate": (
@@ -87,6 +94,10 @@ MESSAGE_ACTIONS = {
         "หรือมุก ให้อธิบายด้วย",
     ),
 }
+# พิมพ์ "จำไว้ว่า ..." ในห้อง AI หรือตอน mention = บันทึกข้อมูลส่วนตัว (/remember) โดยไม่ต้องถาม AI
+REMEMBER_PREFIX = re.compile(r"^\s*(จำไว้ว่า|จำไว้นะว่า|ช่วยจำว่า|remember that)\s*[:：]?\s*(.+)", re.IGNORECASE | re.DOTALL)
+MAX_NOTES = 10
+MAX_NOTE_LENGTH = 200
 REACT_THINKING = "👀"
 REACT_ERROR = "⚠️"
 BRAND_COLOR = discord.Color.from_rgb(88, 101, 242)
@@ -238,10 +249,33 @@ class AIChatBot(discord.Client):
         ctx.footer = ""
         # บุคลิกของห้อง (/persona) — ใช้แทน SYSTEM_PROMPT ระหว่างคำถามนี้
         persona_token = CURRENT_PERSONA.set(self._persona_prompt(ctx) if ctx.use_memory else None)
+        # ข้อมูลที่ผู้ถามขอให้จำไว้ (/remember)
+        notes_token = CURRENT_USER_NOTES.set(self._notes_prompt(ctx) if ctx.use_memory else None)
         try:
             await self._ask_ai(ctx, prompt, on_delta)
         finally:
             CURRENT_PERSONA.reset(persona_token)
+            CURRENT_USER_NOTES.reset(notes_token)
+
+    def _notes_prompt(self, ctx: AnswerContext) -> str | None:
+        notes = self.db.notes(ctx.asker_id)
+        if not notes:
+            return None
+        lines = "\n".join(f"- {n}" for n in notes)
+        return (
+            f"ข้อมูลเกี่ยวกับ {ctx.asker_name} (คนที่กำลังถาม) ที่เขาขอให้คุณจำไว้ "
+            f"ใช้เมื่อเกี่ยวข้องกับคำถามเท่านั้น ไม่ต้องพูดถึงทุกครั้ง:\n{lines}"
+        )
+
+    def remember(self, user_id: int, note: str) -> str:
+        """บันทึกข้อมูลส่วนตัว คืนข้อความแจ้งผล"""
+        note = " ".join(note.split())[:MAX_NOTE_LENGTH]
+        if not note:
+            return "พิมพ์สิ่งที่อยากให้จำด้วยนะ เช่น `ฉันชื่อปีเตอร์ ชอบเล่น FiveM`"
+        if len(self.db.notes(user_id)) >= MAX_NOTES:
+            return f"จำได้สูงสุด {MAX_NOTES} ข้อ ลบข้อเก่าด้วย `/forget` ก่อนนะ (ดูทั้งหมดด้วย `/memory`)"
+        self.db.add_note(user_id, note)
+        return f"📝 จำไว้แล้ว: **{note}**\n-# บอทจะจำเรื่องนี้ได้ทุกห้อง แม้ `/reset` · ดูทั้งหมด `/memory` · ลบ `/forget`"
 
     def _persona_prompt(self, ctx: AnswerContext) -> str | None:
         """บุคลิกของห้องนี้ (เธรดใช้บุคลิกของห้องแม่ถ้าตัวเองไม่ได้ตั้ง)"""
@@ -435,33 +469,44 @@ class AIChatBot(discord.Client):
             if last:
                 view.message = msg
 
-    async def continue_answer(self, interaction: discord.Interaction, view: AnswerView) -> None:
+    async def followup_answer(
+        self, interaction: discord.Interaction, view: AnswerView, kind: str
+    ) -> None:
+        """ปุ่ม ➡️ เขียนต่อ / 📝 สั้นลง / 📖 ละเอียดขึ้น / 🌐 แปล — ส่งเป็นคำตอบใหม่ต่อท้าย"""
         if wait_msg := self._limit_message(interaction.user):
             await interaction.response.send_message(wait_msg, ephemeral=True)
             return
         view.busy = True
         try:
-            await self._continue(interaction, view)
+            await self._followup(interaction, view, kind)
         finally:
             view.busy = False
 
-    async def _continue(self, interaction: discord.Interaction, view: AnswerView) -> None:
+    async def _followup(self, interaction: discord.Interaction, view: AnswerView, kind: str) -> None:
         old = view.ctx
         await interaction.response.defer()
-        # ปุ่ม "เขียนต่อ" ของคำตอบเดิมไม่ต้องใช้แล้ว
-        view.remove_item(view.continue_)
-        try:
-            await interaction.edit_original_response(view=view)
-        except discord.HTTPException:
-            pass
+        if kind == "continue":
+            # ปุ่ม "เขียนต่อ" ของคำตอบเดิมไม่ต้องใช้แล้ว
+            view.remove_item(view.continue_)
+            try:
+                await interaction.edit_original_response(view=view)
+            except discord.HTTPException:
+                pass
+            question, header, use_memory = CONTINUE_QUESTION, "", True
+        else:
+            label, instruction = FOLLOWUPS[kind]
+            question = f"{instruction}\n\n{old.answer[:6000]}"
+            header, use_memory = f"-# {label}\n", False
         ctx = AnswerContext(
             channel=old.channel, channel_id=old.channel_id, asker_id=old.asker_id,
-            asker_name=old.asker_name, question=CONTINUE_QUESTION, images=(), header="",
-            guild_id=old.guild_id, exempt=old.exempt,
+            asker_name=old.asker_name, question=question, images=(), header=header,
+            guild_id=old.guild_id, exempt=old.exempt, use_memory=use_memory,
         )
         async with ctx.channel.typing():
-            await self._run(ctx)
-        await self._deliver(ctx, self._followup_sender(interaction))
+            existing = await self._run_streaming(
+                ctx, lambda content: interaction.followup.send(content, wait=True)
+            )
+        await self._deliver(ctx, self._followup_sender(interaction), existing)
 
     async def delete_answer(self, interaction: discord.Interaction, view: AnswerView) -> None:
         ctx = view.ctx
@@ -523,6 +568,9 @@ class AIChatBot(discord.Client):
 
         # ตัด mention ของบอทออกจากข้อความ
         question = re.sub(rf"<@!?{self.user.id}>", "", message.content).strip()
+        if match := REMEMBER_PREFIX.match(question):
+            await message.reply(self.remember(message.author.id, match.group(2)))
+            return
         # ถ้าข้อความนี้ reply ข้อความอื่น ให้ AI เห็นข้อความ/รูปนั้นด้วย
         quote, quoted_attachments = await self._replied_context(message)
         attachments = [*message.attachments, *quoted_attachments]
@@ -562,17 +610,43 @@ class AIChatBot(discord.Client):
             exempt=self._is_exempt(message.author), search_query=typed,
         )
         await self._react(message, REACT_THINKING)
+        # โหมดเธรด: คำถามใหม่ในห้อง AI เปิดเธรดของตัวเอง แล้วตอบในเธรด (ความจำแยกตามเธรด)
+        target: discord.abc.Messageable = message.channel
+        reply_to: discord.Message | None = message
+        if in_ai_channel and self._thread_mode(message.channel):
+            thread = await self._open_thread(message, typed)
+            if thread is not None:
+                target, reply_to = thread, None
+                ctx.channel, ctx.channel_id = thread, thread.id
+
+        def start(content: str):
+            if reply_to is None:
+                return target.send(content)
+            return reply_to.reply(content, allowed_mentions=REPLY_MENTIONS)
+
         # แสดง "กำลังพิมพ์..." ระหว่างรอ AI แล้วค่อย ๆ แสดงคำตอบเมื่อเริ่มได้ข้อความ
-        async with message.channel.typing():
-            existing = await self._run_streaming(
-                ctx, lambda content: message.reply(content, allowed_mentions=REPLY_MENTIONS)
-            )
+        async with target.typing():
+            existing = await self._run_streaming(ctx, start)
         await self._unreact(message, REACT_THINKING)
         if not ctx.ok:
             await self._react(message, REACT_ERROR)
-        # มี preview แล้ว = reply ไปแล้ว ข้อความที่เหลือส่งต่อท้ายธรรมดา
-        sender = self._channel_sender(message.channel, reply_to=None if existing else message)
+        # มี preview แล้ว = ส่งข้อความแรกไปแล้ว ข้อความที่เหลือส่งต่อท้ายธรรมดา
+        sender = self._channel_sender(target, reply_to=None if existing else reply_to)
         await self._deliver(ctx, sender, existing)
+
+    def _thread_mode(self, channel: discord.abc.Messageable) -> bool:
+        if isinstance(channel, discord.Thread) or not isinstance(channel, discord.TextChannel):
+            return False
+        return self.db.get_setting(f"thread_mode:{channel.id}") == "1"
+
+    async def _open_thread(self, message: discord.Message, typed: str) -> discord.Thread | None:
+        """เปิดเธรดจากข้อความคำถาม (ต้องมีสิทธิ์ Create Public Threads) — ไม่ได้ก็ตอบในห้องปกติ"""
+        title = " ".join(typed.split())[:80] or "📷 คำถามรูปภาพ"
+        try:
+            return await message.create_thread(name=f"💬 {title}", auto_archive_duration=60)
+        except discord.HTTPException as e:
+            log.warning("เปิดเธรดไม่ได้ (ขาดสิทธิ์ Create Public Threads?): %r", e)
+            return None
 
     async def _replied_context(
         self, message: discord.Message
@@ -722,6 +796,7 @@ class AIChatBot(discord.Client):
         @app_commands.choices(
             mode=[
                 app_commands.Choice(name="เปิด — บอทตอบทุกข้อความในห้องนี้", value="on"),
+                app_commands.Choice(name="เปิดแบบเธรด — คำถามใหม่เปิดเธรดของตัวเอง ห้องไม่รก", value="thread"),
                 app_commands.Choice(name="ปิด — กลับไปใช้ /ask หรือ mention", value="off"),
                 app_commands.Choice(name="สถานะ — ดูว่าห้องไหนเปิดอยู่", value="status"),
             ]
@@ -738,9 +813,15 @@ class AIChatBot(discord.Client):
                 await interaction.response.send_message("ใช้คำสั่งนี้ในห้องของเซิร์ฟเวอร์เท่านั้น", ephemeral=True)
                 return
 
-            if mode.value == "on":
+            if mode.value in ("on", "thread"):
                 self.ai_channels.enable(channel_id)
-                await interaction.response.send_message(embed=self._welcome_embed())
+                if mode.value == "thread":
+                    self.db.set_setting(f"thread_mode:{channel_id}", "1")
+                else:
+                    self.db.delete_setting(f"thread_mode:{channel_id}")
+                await interaction.response.send_message(
+                    embed=self._welcome_embed(thread_mode=mode.value == "thread")
+                )
                 # ปักหมุดการ์ดต้อนรับไว้ (ต้องมีสิทธิ์ Pin/Manage Messages ถ้าไม่มีก็ข้าม)
                 try:
                     welcome = await interaction.original_response()
@@ -756,6 +837,7 @@ class AIChatBot(discord.Client):
                     )
                     return
                 self.ai_channels.disable(channel_id)
+                self.db.delete_setting(f"thread_mode:{channel_id}")
                 await interaction.response.send_message(
                     "⏹️ ปิดห้องคุยกับ AI แล้ว ห้องนี้กลับไปใช้ `/ask` หรือ mention บอทเหมือนเดิม"
                 )
@@ -873,6 +955,35 @@ class AIChatBot(discord.Client):
                 "-# ถ้าบอทยังพูดสไตล์เดิม ให้ใช้ `/reset` ล้างความจำของห้องก่อน"
             )
 
+        @self.tree.command(name="remember", description="ให้บอทจำข้อมูลของคุณไว้ (ใช้ได้ทุกห้อง)")
+        @app_commands.describe(note="สิ่งที่อยากให้จำ เช่น ฉันชื่อปีเตอร์ ชอบเล่น FiveM")
+        async def remember_cmd(interaction: discord.Interaction, note: str) -> None:
+            await interaction.response.send_message(
+                self.remember(interaction.user.id, note), ephemeral=True
+            )
+
+        @self.tree.command(name="memory", description="ดูข้อมูลที่บอทจำเกี่ยวกับคุณไว้")
+        async def memory_cmd(interaction: discord.Interaction) -> None:
+            notes = self.db.notes(interaction.user.id)
+            if not notes:
+                text = "ยังไม่ได้ให้บอทจำอะไรเลย ลองพิมพ์ `/remember` หรือ `จำไว้ว่า ...` ในห้อง AI"
+            else:
+                listing = "\n".join(f"`{i}.` {n}" for i, n in enumerate(notes, 1))
+                text = f"📝 **สิ่งที่บอทจำเกี่ยวกับคุณ** ({len(notes)}/{MAX_NOTES})\n{listing}\n-# ลบด้วย `/forget`"
+            await interaction.response.send_message(text, ephemeral=True)
+
+        @self.tree.command(name="forget", description="ลบข้อมูลที่บอทจำเกี่ยวกับคุณ")
+        @app_commands.describe(number="ลำดับที่จะลบ (ดูจาก /memory) — เว้นว่าง = ลบทั้งหมด")
+        async def forget_cmd(interaction: discord.Interaction, number: int | None = None) -> None:
+            if number is None:
+                count = self.db.clear_notes(interaction.user.id)
+                text = f"🧹 ลบข้อมูลที่จำไว้ทั้งหมดแล้ว ({count} ข้อ)"
+            elif (removed := self.db.delete_note(interaction.user.id, number)) is not None:
+                text = f"🗑️ ลบข้อ {number} แล้ว: ~~{removed}~~"
+            else:
+                text = f"ไม่มีข้อที่ {number} — ดูลำดับได้ด้วย `/memory`"
+            await interaction.response.send_message(text, ephemeral=True)
+
         @self.tree.command(name="usage", description="ดูว่าวันนี้ถาม AI ไปแล้วกี่ครั้ง")
         async def usage(interaction: discord.Interaction) -> None:
             used = self.db.used_today(self._today(), interaction.user.id)
@@ -959,7 +1070,7 @@ class AIChatBot(discord.Client):
         )
         return embed
 
-    def _welcome_embed(self) -> discord.Embed:
+    def _welcome_embed(self, thread_mode: bool = False) -> discord.Embed:
         embed = discord.Embed(
             title="💬 ห้องคุยกับ AI",
             description=(
@@ -968,6 +1079,12 @@ class AIChatBot(discord.Client):
             ),
             color=BRAND_COLOR,
         )
+        if thread_mode:
+            embed.add_field(
+                name="🧵 โหมดเธรด",
+                value="พิมพ์คำถามในห้องนี้ บอทจะเปิดเธรดใหม่ให้ แล้วคุยต่อในเธรดนั้นได้เลย (แต่ละเธรดจำแยกกัน)",
+                inline=False,
+            )
         if self.config.max_images:
             embed.add_field(
                 name="📷 ส่งรูปได้",
@@ -976,7 +1093,12 @@ class AIChatBot(discord.Client):
             )
         embed.add_field(
             name="🔘 ปุ่มใต้คำตอบ",
-            value="🔄 ตอบใหม่ · ➡️ เขียนต่อ · 🗑️ ลบ (ใช้ได้ 10 นาที เฉพาะคนถาม)",
+            value="🔄 ตอบใหม่ · ➡️ เขียนต่อ · 🗑️ ลบ · 📝 สั้นลง · 📖 ละเอียดขึ้น · 🌐 แปล\n-# ใช้ได้ 10 นาที เฉพาะคนถาม",
+            inline=False,
+        )
+        embed.add_field(
+            name="📝 ให้บอทจำเรื่องของคุณ",
+            value="พิมพ์ `จำไว้ว่า ฉันชื่อ... ชอบ...` หรือ `/remember` · ดู `/memory` · ลบ `/forget`",
             inline=False,
         )
         embed.add_field(
