@@ -1,0 +1,3 @@
+discord.py>=2.7.1,<3
+python-dotenv>=1.2.0
+# aiohttp ติดตั้งมากับ discord.py อยู่แล้ว ใช้เรียก AI API แบบ async

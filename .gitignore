@@ -1,0 +1,17 @@
+# ความลับ — ห้าม commit เด็ดขาด
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# อื่น ๆ
+*.log
+.DS_Store
+.idea/
+.vscode/

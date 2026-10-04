@@ -1,0 +1,88 @@
+"""อ่านค่าตั้งค่าทั้งหมดจาก .env — ไม่มีการ hardcode ความลับหรือชื่อโมเดล"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+SUPPORTED_PROVIDERS = ("gemini", "groq", "openrouter")
+
+
+class ConfigError(Exception):
+    pass
+
+
+def _get_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise ConfigError(f"{name} ต้องเป็นตัวเลขจำนวนเต็ม (ได้ค่า {raw!r})") from e
+
+
+def _get_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise ConfigError(f"{name} ต้องเป็นตัวเลข (ได้ค่า {raw!r})") from e
+
+
+@dataclass(frozen=True)
+class Config:
+    discord_token: str
+    guild_id: int | None
+    provider: str
+    api_key: str
+    model: str
+    system_prompt: str
+    memory_size: int
+    user_cooldown: float
+    ai_timeout: float
+    temperature: float
+
+    @classmethod
+    def load(cls) -> "Config":
+        token = os.getenv("DISCORD_TOKEN", "").strip()
+        if not token:
+            raise ConfigError("ไม่พบ DISCORD_TOKEN ใน .env")
+
+        provider = os.getenv("AI_PROVIDER", "gemini").strip().lower()
+        if provider not in SUPPORTED_PROVIDERS:
+            raise ConfigError(
+                f"AI_PROVIDER={provider!r} ไม่รองรับ ใช้ได้: {', '.join(SUPPORTED_PROVIDERS)}"
+            )
+
+        prefix = provider.upper()
+        api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
+        model = os.getenv(f"{prefix}_MODEL", "").strip()
+        if not api_key:
+            raise ConfigError(f"ไม่พบ {prefix}_API_KEY ใน .env")
+        if not model:
+            raise ConfigError(f"ไม่พบ {prefix}_MODEL ใน .env")
+
+        guild_raw = os.getenv("GUILD_ID", "").strip()
+        guild_id = _get_int("GUILD_ID", 0) if guild_raw else None
+
+        return cls(
+            discord_token=token,
+            guild_id=guild_id,
+            provider=provider,
+            api_key=api_key,
+            model=model,
+            system_prompt=os.getenv(
+                "SYSTEM_PROMPT", "You are a helpful assistant on Discord."
+            ).strip(),
+            memory_size=max(1, _get_int("MEMORY_SIZE", 10)),
+            user_cooldown=max(0.0, _get_float("USER_COOLDOWN_SECONDS", 10)),
+            ai_timeout=max(5.0, _get_float("AI_TIMEOUT_SECONDS", 60)),
+            temperature=_get_float("AI_TEMPERATURE", 0.7),
+        )
