@@ -169,3 +169,51 @@ def test_backup_chain_status_events(env):
     out = run(main())
     assert out == ["จาก groq", "จาก groq", "จาก gemini", "จาก groq", "ServiceUnavailableError", "จาก groq"]
     assert events == ["down", "up", "outage", "up", "recovered"]
+
+
+def test_check_models_replaces_retired_model(env):
+    env(
+        AI_PROVIDER="openrouter", OPENROUTER_API_KEY="or-key",
+        OPENROUTER_MODEL="meta-llama/llama-3.3-70b-instruct:free",
+        OPENROUTER_VISION_MODEL="old/vision:free",
+    )
+    models = [
+        "apodex/apodex-1.1-mini:free", "google/gemma-4-26b-a4b-it:free",
+        "google/gemma-4-31b-it:free", "openai/gpt-4o", "nvidia/nemotron-3-ultra-550b-a55b:free",
+    ]
+
+    async def handler(request):
+        return web.json_response({"data": [{"id": m} for m in models]})
+
+    async def main():
+        async with serve(("GET", "/models", handler)) as url:
+            provider = P.OpenRouterProvider(Config.load())
+            provider.url = url + "/chat/completions"
+            problems = await provider.check_models()
+            await provider.close()
+        return provider, problems
+
+    provider, problems = run(main())
+    # ตระกูลที่ชอบก่อน แล้วเลือกตัวใหญ่สุด · เดิมใช้ตัวฟรีจึงไม่เลือก openai/gpt-4o
+    assert provider.models == ["google/gemma-4-31b-it:free"]
+    assert provider.model == "google/gemma-4-31b-it:free"
+    assert provider.vision_model is None
+    assert len(problems) == 2 and "ใช้ 'google/gemma-4-31b-it:free' แทน" in problems[0]
+
+
+def test_check_models_drops_only_missing_fallback(env):
+    env(GEMINI_FALLBACK_MODELS="gemini-gone")
+
+    async def handler(request):
+        return web.json_response({"models": [{"name": "models/gemini-test"}]})
+
+    async def main():
+        async with serve(("GET", "/", handler)) as url:
+            provider = P.GeminiProvider(Config.load())
+            provider.BASE_URL = url
+            problems = await provider.check_models()
+            await provider.close()
+        return provider, problems
+
+    provider, problems = run(main())
+    assert provider.models == ["gemini-test"] and len(problems) == 1
