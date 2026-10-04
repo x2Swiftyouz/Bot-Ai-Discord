@@ -136,6 +136,7 @@ class AIChatBot(discord.Client):
         if not self._cleaned_commands:
             self._cleaned_commands = True
             await self._remove_stale_commands()
+            await self.ai.check_models()
 
     async def _remove_stale_commands(self) -> None:
         """ลบคำสั่ง slash ที่ค้างอยู่ใน Discord แต่ไม่ได้มาจากโค้ดนี้

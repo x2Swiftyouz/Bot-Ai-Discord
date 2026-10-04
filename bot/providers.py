@@ -178,6 +178,47 @@ class AIProvider(ABC):
             log.error("%s connection error: %r", self.name, e)
             raise AIError("connection error") from e
 
+    async def _get_json(self, url: str, headers: dict) -> dict:
+        session = await self._get_session()
+        try:
+            async with session.get(url, headers=headers) as resp:
+                await self._raise_for_status(resp, "-")
+                return await resp.json(content_type=None)
+        except TimeoutError as e:
+            raise AITimeoutError("timeout") from e
+        except (aiohttp.ClientError, ValueError) as e:
+            raise AIError(f"list models failed: {e!r}") from e
+
+    async def available_models(self) -> set[str] | None:
+        """รายชื่อโมเดลที่ใช้ได้กับ key นี้ (None = เช็กไม่ได้)"""
+        return None
+
+    @staticmethod
+    def suggest(available: set[str]) -> list[str]:
+        """เลือกชื่อโมเดลตัวอย่างไว้แสดงใน log"""
+        return sorted(available)[:10]
+
+    async def check_models(self) -> None:
+        """ตอนเริ่มบอท: เช็กว่าชื่อโมเดลใน .env ยังมีอยู่จริง (โมเดลฟรีถูกถอดบ่อย) แล้วเตือนใน log"""
+        try:
+            available = await self.available_models()
+        except AIError as e:
+            log.warning("เช็กรายชื่อโมเดลของ %s ไม่ได้ (%r) ข้ามการตรวจ", self.name, e)
+            return
+        if not available:
+            return
+        missing = [m for m in self.models if m not in available]
+        if not missing:
+            log.info("ตรวจโมเดล %s: %s ใช้ได้ ✅", self.name, ", ".join(self.models))
+            return
+        prefix = self.name.upper()
+        for model in missing:
+            log.error(
+                "⚠️ %s ไม่มีโมเดล %r แล้ว (ถูกถอดหรือพิมพ์ผิด) — แก้ %s_MODEL / %s_FALLBACK_MODELS "
+                "ใน .env | ตัวอย่างโมเดลที่ใช้ได้ตอนนี้: %s",
+                self.name, model, prefix, prefix, ", ".join(self.suggest(available)),
+            )
+
     async def _raise_for_status(self, resp: aiohttp.ClientResponse, model: str) -> None:
         """แปลง HTTP error เป็น exception ที่บอทเข้าใจ (ไม่ทำอะไรถ้าสำเร็จ)"""
         if resp.status == 429:
@@ -325,6 +366,22 @@ class GeminiProvider(AIProvider):
         # โมเดลที่โควต้าค้นเว็บหมด: model -> เวลาที่จะลองค้นเว็บได้อีก
         self._search_paused_until: dict[str, float] = {}
 
+    async def available_models(self) -> set[str] | None:
+        data = await self._get_json(
+            f"{self.BASE_URL}?pageSize=1000", {"x-goog-api-key": self.api_keys[0]}
+        )
+        return {
+            m["name"].removeprefix("models/")
+            for m in data.get("models") or []
+            if "generateContent" in (m.get("supportedGenerationMethods") or ["generateContent"])
+        }
+
+    @staticmethod
+    def suggest(available: set[str]) -> list[str]:
+        # รุ่นใหม่ก่อน เฉพาะตระกูล flash / pro
+        names = [m for m in available if "flash" in m or "pro" in m]
+        return sorted(names, reverse=True)[:10]
+
     def _search_enabled(self, model: str) -> bool:
         if not self.web_search or model in self._no_search_models:
             return False
@@ -464,6 +521,20 @@ class OpenAICompatibleProvider(AIProvider):
     def extra_headers(self) -> dict:
         return {}
 
+    async def available_models(self) -> set[str] | None:
+        url = self.url.rsplit("/chat/completions", 1)[0] + "/models"
+        headers = {"Authorization": f"Bearer {self.api_keys[0]}", **self.extra_headers()}
+        data = await self._get_json(url, headers)
+        return {m["id"] for m in data.get("data") or [] if m.get("id")}
+
+    @staticmethod
+    def suggest(available: set[str]) -> list[str]:
+        # ตัดโมเดลเสียง/ตัวกรองออก (ใช้ตอบแชตไม่ได้) และ OpenRouter แสดงเฉพาะตัวฟรี
+        skip = ("whisper", "tts", "guard", "embed", "playai", "orpheus")
+        names = [m for m in available if not any(k in m for k in skip)]
+        free = [m for m in names if m.endswith(":free")]
+        return sorted(free or names)[:10]
+
     async def _generate(
         self,
         model: str,
@@ -586,6 +657,10 @@ class BackupProvider:
             # แจ้งผู้ใช้ด้วย error ของตัวหลัก (สาเหตุแรก) ถ้ามี
             raise primary_error or e from e
         return AIResult(result.text, result.model, result.sources, result.searched, backup=True)
+
+    async def check_models(self) -> None:
+        await self.primary.check_models()
+        await self.backup.check_models()
 
     async def close(self) -> None:
         await self.primary.close()
