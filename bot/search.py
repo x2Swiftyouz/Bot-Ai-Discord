@@ -39,6 +39,8 @@ _FORCE_PREFIX = re.compile(r"^\s*(ค้นหา|ค้นเว็บ|search)\
 # ขึ้นต้นด้วย "หา..." / "ช่วยหา..." = ขอให้ไปหาข้อมูล (ไม่นับ "หาร" "หาย")
 _FIND_PREFIX = re.compile(r"^\s*(ช่วย|รบกวน)?\s*(หา|ค้น)(?![รย])", re.IGNORECASE)
 _VIDEO = re.compile(r"คลิป|วิดีโอ|วีดีโอ|ยูทูป|ยูทูบ|ติ๊กต็อก|\b(video|youtube|tiktok)\b", re.IGNORECASE)
+_TIKTOK = re.compile(r"ติ๊กต็อก|ติกต็อก|\btiktok\b", re.IGNORECASE)
+MIN_VIDEO_RESULTS = 2
 # คำถามสั้น ๆ อย่าง "หาคลิปให้หน่อย" ต้องเอาหัวข้อจากคำถามก่อนหน้ามาค้นด้วย
 SHORT_QUERY = 25
 _NEWS = re.compile(r"ข่าว|\bnews\b", re.IGNORECASE)
@@ -81,21 +83,15 @@ class TavilySearch:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def search(self, question: str, context: str = "") -> list[SearchResult]:
-        """context: คำถามก่อนหน้าในห้อง ใช้เติมหัวข้อเมื่อคำถามนี้สั้นและกว้างเกินไป"""
-        query = _FORCE_PREFIX.sub("", question).strip()
-        if context and len(query) < SHORT_QUERY:
-            query = f"{context.strip()[:300]} {query}"
-        query = query[:400]
+    async def _request(self, query: str, domains: list[str] | None = None) -> list[SearchResult]:
         payload: dict = {
             "query": query,
             "max_results": self.max_results,
             "search_depth": "basic",
             "topic": "news" if _NEWS.search(query) else "general",
         }
-        if _VIDEO.search(query):
-            # ขอคลิป → ค้นเฉพาะเว็บวิดีโอ จะได้ลิงก์คลิปจริง
-            payload["include_domains"] = ["youtube.com", "tiktok.com"]
+        if domains:
+            payload["include_domains"] = domains
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=self._timeout)
         try:
@@ -108,12 +104,28 @@ class TavilySearch:
                 data = await resp.json(content_type=None)
         except (TimeoutError, aiohttp.ClientError) as e:
             raise SearchError(f"Tavily connection error: {e!r}") from e
-
-        results = [
+        return [
             SearchResult(r.get("title") or r.get("url", ""), r["url"], (r.get("content") or "")[:700])
             for r in data.get("results") or []
             if r.get("url")
         ]
+
+    async def search(self, question: str, context: str = "") -> list[SearchResult]:
+        """context: คำถามก่อนหน้าในห้อง ใช้เติมหัวข้อเมื่อคำถามนี้สั้นและกว้างเกินไป"""
+        query = _FORCE_PREFIX.sub("", question).strip()
+        if context and len(query) < SHORT_QUERY:
+            query = f"{context.strip()[:300]} {query}"
+        query = query[:400]
+        if not _VIDEO.search(query):
+            results = await self._request(query)
+        elif _TIKTOK.search(query):
+            results = await self._request(query, ["tiktok.com"])
+        else:
+            # ขอคลิป → YouTube ก่อน (ตรงหัวข้อกว่า) ถ้าได้น้อยเกินค่อยเติมจาก TikTok
+            results = await self._request(query, ["youtube.com"])
+            if len(results) < MIN_VIDEO_RESULTS:
+                seen = {r.url for r in results}
+                results += [r for r in await self._request(query, ["tiktok.com"]) if r.url not in seen]
         log.info("ค้นเว็บ (Tavily): %r → %d ผลลัพธ์", query, len(results))
         return results
 

@@ -35,7 +35,9 @@ from bot.providers import (
 from bot.search import SearchError, TavilySearch, format_results, is_video_query, should_search
 from bot.storage import Database
 from bot.streaming import StreamPreview
-from bot.utils import now_text, redact, split_message, suppress_link_previews, tables_to_lists
+from bot.utils import (
+    DISCORD_LIMIT, now_text, redact, split_message, suppress_link_previews, tables_to_lists,
+)
 from bot.views import AnswerContext, AnswerView, CloseThreadView
 
 logging.basicConfig(
@@ -407,20 +409,29 @@ class AIChatBot(discord.Client):
         """แบ่งคำตอบเป็นข้อความ ถ้ายาวมาก (LONG_ANSWER_FILE_CHARS) แสดงส่วนต้น + แนบฉบับเต็มเป็นไฟล์ .txt
 
         ตาราง Markdown ถูกแปลงเป็นรายการ เพราะ Discord แสดงตารางไม่ได้ (ไฟล์แนบเก็บตารางเดิมไว้)
+        ส่วนท้าย (รายการคลิป + บรรทัดเล็ก) อยู่ในข้อความเดียวกันเสมอ ไม่ถูกตัดกลาง
         """
-        footer = f"\n{ctx.footer}" if ctx.footer else ""
+        tail = ctx.extras + (f"\n{ctx.footer}" if ctx.footer else "")
         answer = suppress_link_previews(tables_to_lists(ctx.answer))
         limit = self.config.long_answer_file_chars
         if allow_file and ctx.ok and limit and len(answer) > limit:
-            preview = split_message(answer, LONG_ANSWER_PREVIEW)[0]
-            text = (
-                f"{ctx.header}{preview}\n…\n"
-                f"-# 📄 คำตอบยาว {len(ctx.answer):,} ตัวอักษร — ฉบับเต็มอยู่ในไฟล์แนบ{ctx.extras}{footer}"
-            )
+            note = f"\n…\n-# 📄 คำตอบยาว {len(ctx.answer):,} ตัวอักษร — ฉบับเต็มอยู่ในไฟล์แนบ"
+            # ย่อส่วนต้นให้พอดีข้อความเดียวพร้อมส่วนท้าย
+            budget = DISCORD_LIMIT - len(ctx.header) - len(note) - len(tail) - 20
+            preview = split_message(answer, max(300, min(LONG_ANSWER_PREVIEW, budget)))[0]
             file = discord.File(io.BytesIO(ctx.answer.encode("utf-8")), filename="answer.txt")
-            return split_message(text), file
-        text = ctx.header + answer + ctx.extras + footer
-        return split_message(text) or ["(AI ไม่ได้ส่งข้อความกลับมา)"], None
+            return self._attach_tail(split_message(ctx.header + preview + note), tail), file
+        chunks = split_message(ctx.header + answer) or ["(AI ไม่ได้ส่งข้อความกลับมา)"]
+        return self._attach_tail(chunks, tail), None
+
+    @staticmethod
+    def _attach_tail(chunks: list[str], tail: str) -> list[str]:
+        """ต่อส่วนท้ายเข้ากับข้อความสุดท้าย ถ้าไม่พอค่อยแยกเป็นข้อความใหม่ทั้งก้อน"""
+        if not tail:
+            return chunks
+        if len(chunks[-1]) + len(tail) <= DISCORD_LIMIT:
+            return [*chunks[:-1], chunks[-1] + tail]
+        return [*chunks, *split_message(tail)]
 
     def _chunks(self, ctx: AnswerContext) -> list[str]:
         return self._render(ctx)[0]
