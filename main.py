@@ -5,19 +5,24 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import re
 import sys
+from collections.abc import Awaitable, Callable, Sequence
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 
 from bot.channels import AIChannelStore
 from bot.config import Config, ConfigError
 from bot.cooldown import UserCooldown
+from bot.media import is_image, read_images
 from bot.memory import ChannelMemory
-from bot.providers import AIError, AIProvider, create_provider
+from bot.providers import AIError, AIProvider, ImageData, create_provider
 from bot.utils import split_message
+from bot.views import AnswerContext, AnswerView
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +36,17 @@ SAFE_MENTIONS = discord.AllowedMentions.none()
 REPLY_MENTIONS = discord.AllowedMentions(
     everyone=False, users=False, roles=False, replied_user=True
 )
+
+# ข้อความในห้องคุยกับ AI ที่ขึ้นต้นด้วยสิ่งนี้ บอทจะไม่ตอบ (ไว้คุยกันเอง)
+IGNORE_PREFIX = "//"
+IMAGE_ONLY_QUESTION = "ช่วยอธิบายรูปนี้หน่อย"
+CONTINUE_QUESTION = "เขียนต่อจากคำตอบก่อนหน้าให้จบ ต่อจากจุดที่ค้างไว้เลย ไม่ต้องทวนซ้ำ"
+REACT_THINKING = "👀"
+REACT_ERROR = "⚠️"
+BRAND_COLOR = discord.Color.from_rgb(88, 101, 242)
+
+# ส่งข้อความ 1 ก้อน (พร้อมปุ่มถ้ามี) แล้วคืนข้อความที่ส่งไป
+Sender = Callable[[str, "discord.ui.View | None"], Awaitable["discord.Message | discord.WebhookMessage"]]
 
 
 class AIChatBot(discord.Client):
@@ -47,6 +63,8 @@ class AIChatBot(discord.Client):
             config.ai_channel_ids, config.data_dir / "ai_channels.json"
         )
         self.ai: AIProvider = create_provider(config)
+        self.answer_count = 0
+        self._statuses = itertools.cycle(self._status_texts())
         self._register_commands()
 
     # ---------- lifecycle ----------
@@ -60,15 +78,33 @@ class AIChatBot(discord.Client):
         else:
             synced = await self.tree.sync()
             log.info("Synced %d global command(s) (อาจใช้เวลาสักพักกว่าจะขึ้น)", len(synced))
+        self.rotate_status.start()
 
     async def on_ready(self) -> None:
         log.info(
             "Logged in as %s (ID %s) | provider=%s model=%s",
             self.user, self.user.id if self.user else "?", self.config.provider, self.config.model,
         )
-        await self.change_presence(
-            activity=discord.Activity(type=discord.ActivityType.listening, name="/ask หรือ @mention")
-        )
+
+    def _status_texts(self) -> list[Callable[[], str]]:
+        texts: list[Callable[[], str]] = [
+            lambda: "💬 พิมพ์คุยในห้อง AI ได้เลย",
+            lambda: "❓ /ask ถามอะไรก็ได้",
+            lambda: f"✨ ตอบไปแล้ว {self.answer_count:,} ครั้ง",
+        ]
+        if self.config.max_images:
+            texts.insert(2, lambda: "📷 ส่งรูปให้ช่วยดูได้นะ")
+        return texts
+
+    @tasks.loop(seconds=30)
+    async def rotate_status(self) -> None:
+        """สถานะบอทหมุนเวียนทุก 30 วินาที"""
+        text = next(self._statuses)()
+        await self.change_presence(activity=discord.CustomActivity(name=text))
+
+    @rotate_status.before_loop
+    async def _before_rotate_status(self) -> None:
+        await self.wait_until_ready()
 
     async def close(self) -> None:
         await self.ai.close()
@@ -76,22 +112,156 @@ class AIChatBot(discord.Client):
 
     # ---------- core ----------
 
-    async def ask_ai(self, channel_id: int, author: str, question: str) -> str:
-        """ส่งคำถามไปยัง AI พร้อมบริบทของช่อง คืนคำตอบ (หรือข้อความแจ้ง error)"""
+    async def ask_ai(
+        self, channel_id: int, author: str, question: str, images: Sequence[ImageData] = ()
+    ) -> tuple[bool, str, str]:
+        """ส่งคำถามไปยัง AI พร้อมบริบทของช่อง
+
+        คืน (สำเร็จไหม, คำตอบหรือข้อความแจ้ง error, ข้อความที่บันทึกลงความจำ)
+        """
         # ใส่ชื่อผู้ถาม เพราะในช่องเดียวอาจมีหลายคนคุยกับบอท
         prompt = f"{author}: {question}"
+        # ความจำเก็บแค่ข้อความ ไม่เก็บรูป (ประหยัดโควต้า) จึงจดไว้ว่ามีรูปแนบ
+        memory_text = prompt + (f" [แนบรูป {len(images)} รูป]" if images else "")
         async with self.memory.lock(channel_id):
             history = self.memory.get(channel_id)
             try:
-                answer = await self.ai.generate(history, prompt)
+                answer = await self.ai.generate(history, prompt, images)
             except AIError as e:
                 log.warning("AI error in channel %s: %r", channel_id, e)
-                return e.user_message
+                return False, e.user_message, memory_text
             except Exception:
                 log.exception("Unexpected error while calling AI")
-                return "⚠️ เกิดข้อผิดพลาดที่ไม่คาดคิด ลองใหม่อีกครั้งนะ"
-            self.memory.add_exchange(channel_id, prompt, answer)
-            return answer
+                return False, "⚠️ เกิดข้อผิดพลาดที่ไม่คาดคิด ลองใหม่อีกครั้งนะ", memory_text
+            self.memory.add_exchange(channel_id, memory_text, answer)
+            self.answer_count += 1
+            return True, answer, memory_text
+
+    async def _run(self, ctx: AnswerContext) -> None:
+        """ถาม AI ตามข้อมูลใน ctx แล้วเก็บผลลัพธ์กลับลง ctx"""
+        ctx.ok, ctx.answer, ctx.prompt = await self.ask_ai(
+            ctx.channel_id, ctx.asker_name, ctx.question, ctx.images
+        )
+
+    def _chunks(self, ctx: AnswerContext) -> list[str]:
+        return split_message(ctx.header + ctx.answer) or ["(AI ไม่ได้ส่งข้อความกลับมา)"]
+
+    async def _deliver(self, ctx: AnswerContext, send: Sender) -> None:
+        """ส่งคำตอบ (ตัดเป็นหลายข้อความถ้ายาว) พร้อมปุ่มใต้ข้อความสุดท้าย"""
+        view = AnswerView(self, ctx)
+        chunks = self._chunks(ctx)
+        try:
+            for i, chunk in enumerate(chunks):
+                last = i == len(chunks) - 1
+                msg = await send(chunk, view if last else None)
+                ctx.message_ids.append(msg.id)
+                if last:
+                    view.message = msg
+        except discord.HTTPException:
+            log.exception("Failed to send answer")
+            view.stop()
+
+    def _channel_sender(
+        self, channel: discord.abc.Messageable, reply_to: discord.Message | None = None
+    ) -> Sender:
+        first = True
+
+        async def send(content: str, view: discord.ui.View | None):
+            nonlocal first
+            kwargs = {"view": view} if view else {}
+            if first and reply_to is not None:
+                first = False
+                return await reply_to.reply(content, allowed_mentions=REPLY_MENTIONS, **kwargs)
+            first = False
+            return await channel.send(content, **kwargs)
+
+        return send
+
+    @staticmethod
+    def _followup_sender(interaction: discord.Interaction) -> Sender:
+        async def send(content: str, view: discord.ui.View | None):
+            kwargs = {"view": view} if view else {}
+            return await interaction.followup.send(content, wait=True, **kwargs)
+
+        return send
+
+    # ---------- ปุ่มใต้คำตอบ ----------
+
+    async def _delete_messages(self, ctx: AnswerContext, ids: Sequence[int]) -> None:
+        for mid in ids:
+            try:
+                await ctx.channel.get_partial_message(mid).delete()  # type: ignore[attr-defined]
+            except discord.HTTPException:
+                pass
+
+    async def regenerate_answer(self, interaction: discord.Interaction, view: AnswerView) -> None:
+        if wait_msg := self._cooldown_message(interaction.user.id):
+            await interaction.response.send_message(wait_msg, ephemeral=True)
+            return
+        view.busy = True
+        try:
+            await self._regenerate(interaction, view)
+        finally:
+            view.busy = False
+
+    async def _regenerate(self, interaction: discord.Interaction, view: AnswerView) -> None:
+        ctx = view.ctx
+        await interaction.response.defer()
+        if ctx.ok:
+            self.memory.remove_exchange(ctx.channel_id, ctx.prompt, ctx.answer)
+        async with ctx.channel.typing():
+            await self._run(ctx)
+        view.refresh()
+
+        # ข้อความที่มีปุ่ม (ข้อความสุดท้าย) จะถูกแก้เป็นคำตอบใหม่ ส่วนข้อความอื่นของคำตอบเดิมลบทิ้ง
+        source_id = interaction.message.id if interaction.message else None
+        await self._delete_messages(ctx, [m for m in ctx.message_ids if m != source_id])
+        chunks = self._chunks(ctx)
+        single = len(chunks) == 1
+        await interaction.edit_original_response(content=chunks[0], view=view if single else None)
+        ctx.message_ids = [source_id] if source_id else []
+        for i, chunk in enumerate(chunks[1:], start=1):
+            last = i == len(chunks) - 1
+            kwargs = {"view": view} if last else {}
+            msg = await interaction.followup.send(chunk, wait=True, **kwargs)
+            ctx.message_ids.append(msg.id)
+            if last:
+                view.message = msg
+
+    async def continue_answer(self, interaction: discord.Interaction, view: AnswerView) -> None:
+        if wait_msg := self._cooldown_message(interaction.user.id):
+            await interaction.response.send_message(wait_msg, ephemeral=True)
+            return
+        view.busy = True
+        try:
+            await self._continue(interaction, view)
+        finally:
+            view.busy = False
+
+    async def _continue(self, interaction: discord.Interaction, view: AnswerView) -> None:
+        old = view.ctx
+        await interaction.response.defer()
+        # ปุ่ม "เขียนต่อ" ของคำตอบเดิมไม่ต้องใช้แล้ว
+        view.remove_item(view.continue_)
+        try:
+            await interaction.edit_original_response(view=view)
+        except discord.HTTPException:
+            pass
+        ctx = AnswerContext(
+            channel=old.channel, channel_id=old.channel_id, asker_id=old.asker_id,
+            asker_name=old.asker_name, question=CONTINUE_QUESTION, images=(), header="",
+        )
+        async with ctx.channel.typing():
+            await self._run(ctx)
+        await self._deliver(ctx, self._followup_sender(interaction))
+
+    async def delete_answer(self, interaction: discord.Interaction, view: AnswerView) -> None:
+        ctx = view.ctx
+        await interaction.response.defer()
+        if ctx.ok:
+            self.memory.remove_exchange(ctx.channel_id, ctx.prompt, ctx.answer)
+        view.stop()
+        await self._delete_messages(ctx, ctx.message_ids)
 
     def _cooldown_message(self, user_id: int) -> str | None:
         remaining = self.cooldown.check(user_id)
@@ -120,11 +290,14 @@ class AIChatBot(discord.Client):
         mentioned = self.user in message.mentions
         if not (in_ai_channel or mentioned):
             return
+        if message.content.lstrip().startswith(IGNORE_PREFIX):
+            return
 
         # ตัด mention ของบอทออกจากข้อความ
         question = re.sub(rf"<@!?{self.user.id}>", "", message.content).strip()
-        if not question:
-            # ในห้องคุยกับ AI ข้อความที่มีแต่รูป/สติกเกอร์ ให้ข้ามไปเงียบ ๆ
+        has_image = self.config.max_images > 0 and any(map(is_image, message.attachments))
+        if not question and not has_image:
+            # ในห้องคุยกับ AI ข้อความที่มีแต่สติกเกอร์/ไฟล์อื่น ให้ข้ามไปเงียบ ๆ
             if not in_ai_channel:
                 await message.reply("สวัสดี! พิมพ์คำถามต่อจากการ mention ได้เลย หรือใช้ `/ask` ก็ได้ 😊")
             return
@@ -133,45 +306,87 @@ class AIChatBot(discord.Client):
             await message.reply(wait_msg, delete_after=10)
             return
 
+        images: list[ImageData] = []
+        if has_image:
+            images, skipped = await read_images(
+                message.attachments, self.config.max_images, self.config.max_image_bytes
+            )
+            if skipped:
+                await message.reply(
+                    "📷 ข้ามรูปเหล่านี้: " + ", ".join(skipped), delete_after=20,
+                    allowed_mentions=REPLY_MENTIONS,
+                )
+            if not images and not question:
+                return
+
+        ctx = AnswerContext(
+            channel=message.channel, channel_id=message.channel.id,
+            asker_id=message.author.id, asker_name=message.author.display_name,
+            question=question or IMAGE_ONLY_QUESTION, images=tuple(images), header="",
+        )
+        await self._react(message, REACT_THINKING)
         # แสดง "กำลังพิมพ์..." ระหว่างรอ AI
         async with message.channel.typing():
-            answer = await self.ask_ai(message.channel.id, message.author.display_name, question)
+            await self._run(ctx)
+        await self._unreact(message, REACT_THINKING)
+        if not ctx.ok:
+            await self._react(message, REACT_ERROR)
+        await self._deliver(ctx, self._channel_sender(message.channel, reply_to=message))
 
-        await self._send_reply(message, answer)
-
-    async def _send_reply(self, message: discord.Message, text: str) -> None:
-        chunks = split_message(text) or ["(AI ไม่ได้ส่งข้อความกลับมา)"]
+    async def _react(self, message: discord.Message, emoji: str) -> None:
+        # ต้องมีสิทธิ์ Add Reactions + Read Message History ถ้าไม่มีก็ข้ามไปเงียบ ๆ
         try:
-            await message.reply(chunks[0], allowed_mentions=REPLY_MENTIONS)
-            for chunk in chunks[1:]:
-                await message.channel.send(chunk)
+            await message.add_reaction(emoji)
         except discord.HTTPException:
-            log.exception("Failed to send reply")
+            pass
+
+    async def _unreact(self, message: discord.Message, emoji: str) -> None:
+        if self.user is None:
+            return
+        try:
+            await message.remove_reaction(emoji, self.user)
+        except discord.HTTPException:
+            pass
 
     # ---------- slash commands ----------
 
     def _register_commands(self) -> None:
         @self.tree.command(name="ask", description="ถามคำถามกับ AI")
-        @app_commands.describe(question="คำถามของคุณ")
-        async def ask(interaction: discord.Interaction, question: str) -> None:
+        @app_commands.describe(question="คำถามของคุณ", image="(ไม่บังคับ) แนบรูปให้ AI ดู")
+        async def ask(
+            interaction: discord.Interaction,
+            question: str,
+            image: discord.Attachment | None = None,
+        ) -> None:
             if wait_msg := self._cooldown_message(interaction.user.id):
                 await interaction.response.send_message(wait_msg, ephemeral=True)
                 return
 
             # defer: บอก Discord ว่ากำลังประมวลผล (ขึ้น "กำลังคิด...") และขยายเวลาตอบจาก 3 วินาทีเป็น 15 นาที
             await interaction.response.defer(thinking=True)
-            channel_id = interaction.channel_id or interaction.user.id
-            answer = await self.ask_ai(channel_id, interaction.user.display_name, question)
+            images: list[ImageData] = []
+            note = ""
+            if image is not None:
+                if self.config.max_images == 0:
+                    note = "\n-# 📷 ผู้ดูแลปิดการอ่านรูปไว้"
+                else:
+                    images, skipped = await read_images(
+                        [image], self.config.max_images, self.config.max_image_bytes
+                    )
+                    if skipped:
+                        note = "\n-# 📷 ข้ามรูป: " + ", ".join(skipped)
 
             # แสดงคำถามด้วย เพราะคนอื่นในช่องจะไม่เห็นว่าถามอะไร
-            header = f"> **{interaction.user.display_name}:** {question[:300]}\n\n"
-            chunks = split_message(header + answer)
-            try:
-                await interaction.followup.send(chunks[0])
-                for chunk in chunks[1:]:
-                    await interaction.followup.send(chunk)
-            except discord.HTTPException:
-                log.exception("Failed to send followup")
+            attached = " 📷" if images else ""
+            header = f"> **{interaction.user.display_name}:** {question[:300]}{attached}{note}\n\n"
+            ctx = AnswerContext(
+                channel=interaction.channel,  # type: ignore[arg-type]
+                channel_id=interaction.channel_id or interaction.user.id,
+                asker_id=interaction.user.id, asker_name=interaction.user.display_name,
+                question=question, images=tuple(images), header=header,
+            )
+            await self._run(ctx)
+            await self._deliver(ctx, self._followup_sender(interaction))
 
         @self.tree.command(name="reset", description="ล้างความจำบทสนทนาของ AI ในช่องนี้")
         async def reset(interaction: discord.Interaction) -> None:
@@ -204,10 +419,13 @@ class AIChatBot(discord.Client):
 
             if mode.value == "on":
                 self.ai_channels.enable(channel_id)
-                await interaction.response.send_message(
-                    "✅ ตั้งห้องนี้เป็น **ห้องคุยกับ AI** แล้ว พิมพ์คุยได้เลย ไม่ต้องใช้ `/ask` 💬\n"
-                    "ใช้ `/reset` เพื่อล้างความจำ หรือ `/aichannel ปิด` เพื่อยกเลิก"
-                )
+                await interaction.response.send_message(embed=self._welcome_embed())
+                # ปักหมุดการ์ดต้อนรับไว้ (ต้องมีสิทธิ์ Pin/Manage Messages ถ้าไม่มีก็ข้าม)
+                try:
+                    welcome = await interaction.original_response()
+                    await welcome.pin(reason="การ์ดวิธีใช้ห้องคุยกับ AI")
+                except discord.HTTPException:
+                    log.info("Could not pin welcome message in %s (missing permission?)", channel_id)
             elif mode.value == "off":
                 if self.ai_channels.is_fixed(channel_id):
                     await interaction.response.send_message(
@@ -233,6 +451,10 @@ class AIChatBot(discord.Client):
                     ephemeral=True,
                 )
 
+        @self.tree.command(name="help", description="วิธีใช้บอท AI")
+        async def help_(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message(embed=self._welcome_embed(), ephemeral=True)
+
         @self.tree.error
         async def on_app_command_error(
             interaction: discord.Interaction, error: app_commands.AppCommandError
@@ -246,6 +468,39 @@ class AIChatBot(discord.Client):
                     await interaction.response.send_message(msg, ephemeral=True)
             except discord.HTTPException:
                 pass
+
+
+    def _welcome_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="💬 ห้องคุยกับ AI",
+            description=(
+                "พิมพ์คุยได้เลย **ไม่ต้องใช้ `/ask` หรือ mention** บอทจะตอบทุกข้อความในห้องนี้\n"
+                "ห้องอื่นใช้ `/ask` หรือ `@บอท คำถาม` ได้เหมือนเดิม"
+            ),
+            color=BRAND_COLOR,
+        )
+        if self.config.max_images:
+            embed.add_field(
+                name="📷 ส่งรูปได้",
+                value=f"แนบรูปพร้อมคำถาม (png / jpg / webp สูงสุด {self.config.max_images} รูป)",
+                inline=False,
+            )
+        embed.add_field(
+            name="🔘 ปุ่มใต้คำตอบ",
+            value="🔄 ตอบใหม่ · ➡️ เขียนต่อ · 🗑️ ลบ (ใช้ได้ 10 นาที เฉพาะคนถาม)",
+            inline=False,
+        )
+        embed.add_field(
+            name="🤫 คุยกันเอง",
+            value=f"ขึ้นต้นข้อความด้วย `{IGNORE_PREFIX}` บอทจะไม่ตอบ",
+            inline=False,
+        )
+        embed.add_field(name="🧹 ล้างความจำ", value="`/reset`", inline=True)
+        embed.add_field(name="⏹️ ปิดห้องนี้", value="`/aichannel ปิด`", inline=True)
+        if self.user:
+            embed.set_thumbnail(url=self.user.display_avatar.url)
+        embed.set_footer(text=f"AI: {self.config.provider} · {self.config.model}")
+        return embed
 
 
 def main() -> None:

@@ -42,5 +42,21 @@ class ChannelMemory:
         history.append(ChatMessage("user", user_text))
         history.append(ChatMessage("assistant", bot_text))
 
+    def remove_exchange(self, channel_id: int, user_text: str, bot_text: str) -> bool:
+        """ลบคู่คำถาม+คำตอบที่ระบุออก (ใช้ตอนกด 🔄 ตอบใหม่ หรือ 🗑️ ลบ) คืน True ถ้าเจอ"""
+        history = self._history.get(channel_id)
+        if not history:
+            return False
+        items = list(history)
+        for i in range(len(items) - 1):
+            if items[i] == ChatMessage("user", user_text) and items[i + 1] == ChatMessage(
+                "assistant", bot_text
+            ):
+                del items[i : i + 2]
+                history.clear()
+                history.extend(items)
+                return True
+        return False
+
     def reset(self, channel_id: int) -> None:
         self._history.pop(channel_id, None)
