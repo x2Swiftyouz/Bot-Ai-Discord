@@ -33,6 +33,7 @@ class AnswerContext:
     ok: bool = False
     prompt: str = ""
     answer: str = ""
+    footer: str = ""  # บรรทัดเล็กใต้คำตอบ (ไม่เก็บลงความจำ)
     message_ids: list[int] = field(default_factory=list)
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
@@ -25,6 +26,17 @@ def _get_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError as e:
         raise ConfigError(f"{name} ต้องเป็นตัวเลขจำนวนเต็ม (ได้ค่า {raw!r})") from e
+
+
+def _get_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{name} ต้องเป็น true หรือ false (ได้ค่า {raw!r})")
 
 
 def _get_float(name: str, default: float) -> float:
@@ -49,6 +61,9 @@ class Config:
     fallback_models: tuple[str, ...]
     max_retries: int
     system_prompt: str
+    timezone: str
+    web_search: bool
+    show_footer: bool
     memory_size: int
     max_images: int
     max_image_bytes: int
@@ -87,6 +102,15 @@ class Config:
         except ValueError as e:
             raise ConfigError("AI_CHANNEL_IDS ต้องเป็นตัวเลข ID ช่อง คั่นด้วยจุลภาค") from e
 
+        timezone = os.getenv("TIMEZONE", "").strip() or "Asia/Bangkok"
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError) as e:
+            raise ConfigError(
+                f"TIMEZONE={timezone!r} ไม่ถูกต้อง (ตัวอย่าง: Asia/Bangkok) "
+                "ถ้าใช้ Windows ให้รัน pip install -r requirements.txt ใหม่"
+            ) from e
+
         guild_raw = os.getenv("GUILD_ID", "").strip()
         guild_id = _get_int("GUILD_ID", 0) if guild_raw else None
 
@@ -103,6 +127,9 @@ class Config:
             system_prompt=os.getenv(
                 "SYSTEM_PROMPT", "You are a helpful assistant on Discord."
             ).strip(),
+            timezone=timezone,
+            web_search=_get_bool("WEB_SEARCH", True),
+            show_footer=_get_bool("SHOW_FOOTER", True),
             memory_size=max(1, _get_int("MEMORY_SIZE", 10)),
             max_images=max(0, _get_int("MAX_IMAGES", 4)),
             max_image_bytes=int(max(0.1, _get_float("MAX_IMAGE_MB", 5)) * 1024 * 1024),

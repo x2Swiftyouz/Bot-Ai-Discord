@@ -9,6 +9,7 @@ import itertools
 import logging
 import re
 import sys
+import time
 from collections.abc import Awaitable, Callable, Sequence
 
 import discord
@@ -40,6 +41,8 @@ REPLY_MENTIONS = discord.AllowedMentions(
 # ข้อความในห้องคุยกับ AI ที่ขึ้นต้นด้วยสิ่งนี้ บอทจะไม่ตอบ (ไว้คุยกันเอง)
 IGNORE_PREFIX = "//"
 IMAGE_ONLY_QUESTION = "ช่วยอธิบายรูปนี้หน่อย"
+REPLY_ONLY_QUESTION = "ช่วยอธิบายหรือตอบข้อความนี้หน่อย"
+MAX_SOURCES = 3
 CONTINUE_QUESTION = "เขียนต่อจากคำตอบก่อนหน้าให้จบ ต่อจากจุดที่ค้างไว้เลย ไม่ต้องทวนซ้ำ"
 REACT_THINKING = "👀"
 REACT_ERROR = "⚠️"
@@ -114,10 +117,10 @@ class AIChatBot(discord.Client):
 
     async def ask_ai(
         self, channel_id: int, author: str, question: str, images: Sequence[ImageData] = ()
-    ) -> tuple[bool, str, str]:
+    ) -> tuple[bool, str, str, str]:
         """ส่งคำถามไปยัง AI พร้อมบริบทของช่อง
 
-        คืน (สำเร็จไหม, คำตอบหรือข้อความแจ้ง error, ข้อความที่บันทึกลงความจำ)
+        คืน (สำเร็จไหม, คำตอบหรือข้อความแจ้ง error, ข้อความที่บันทึกลงความจำ, บรรทัดเล็กใต้คำตอบ)
         """
         # ใส่ชื่อผู้ถาม เพราะในช่องเดียวอาจมีหลายคนคุยกับบอท
         prompt = f"{author}: {question}"
@@ -125,26 +128,43 @@ class AIChatBot(discord.Client):
         memory_text = prompt + (f" [แนบรูป {len(images)} รูป]" if images else "")
         async with self.memory.lock(channel_id):
             history = self.memory.get(channel_id)
+            started = time.monotonic()
             try:
-                answer = await self.ai.generate(history, prompt, images)
+                result = await self.ai.generate(history, prompt, images)
             except AIError as e:
                 log.warning("AI error in channel %s: %r", channel_id, e)
-                return False, e.user_message, memory_text
+                return False, e.user_message, memory_text, ""
             except Exception:
                 log.exception("Unexpected error while calling AI")
-                return False, "⚠️ เกิดข้อผิดพลาดที่ไม่คาดคิด ลองใหม่อีกครั้งนะ", memory_text
-            self.memory.add_exchange(channel_id, memory_text, answer)
+                return False, "⚠️ เกิดข้อผิดพลาดที่ไม่คาดคิด ลองใหม่อีกครั้งนะ", memory_text, ""
+            self.memory.add_exchange(channel_id, memory_text, result.text)
             self.answer_count += 1
-            return True, answer, memory_text
+            return True, result.text, memory_text, self._footer(result, time.monotonic() - started)
+
+    def _footer(self, result, elapsed: float) -> str:
+        """บรรทัดตัวเล็ก (-#) ใต้คำตอบ: เวลาที่ใช้ · โมเดล · แหล่งที่มาจากการค้นเว็บ"""
+        if not self.config.show_footer:
+            return ""
+        info = f"-# ⚡ {elapsed:.1f} วิ · {result.model}"
+        if result.searched:
+            info += " · 🔎 ค้นเว็บ"
+        if result.sources:
+            # <ลิงก์> กันไม่ให้ Discord แสดงพรีวิวลิงก์ใหญ่ ๆ
+            links = " · ".join(
+                f"[{title[:40]}](<{uri}>)" for title, uri in result.sources[:MAX_SOURCES]
+            )
+            info += f"\n-# 📚 แหล่งที่มา: {links}"
+        return info
 
     async def _run(self, ctx: AnswerContext) -> None:
         """ถาม AI ตามข้อมูลใน ctx แล้วเก็บผลลัพธ์กลับลง ctx"""
-        ctx.ok, ctx.answer, ctx.prompt = await self.ask_ai(
+        ctx.ok, ctx.answer, ctx.prompt, ctx.footer = await self.ask_ai(
             ctx.channel_id, ctx.asker_name, ctx.question, ctx.images
         )
 
     def _chunks(self, ctx: AnswerContext) -> list[str]:
-        return split_message(ctx.header + ctx.answer) or ["(AI ไม่ได้ส่งข้อความกลับมา)"]
+        text = ctx.header + ctx.answer + (f"\n{ctx.footer}" if ctx.footer else "")
+        return split_message(text) or ["(AI ไม่ได้ส่งข้อความกลับมา)"]
 
     async def _deliver(self, ctx: AnswerContext, send: Sender) -> None:
         """ส่งคำตอบ (ตัดเป็นหลายข้อความถ้ายาว) พร้อมปุ่มใต้ข้อความสุดท้าย"""
@@ -295,8 +315,11 @@ class AIChatBot(discord.Client):
 
         # ตัด mention ของบอทออกจากข้อความ
         question = re.sub(rf"<@!?{self.user.id}>", "", message.content).strip()
-        has_image = self.config.max_images > 0 and any(map(is_image, message.attachments))
-        if not question and not has_image:
+        # ถ้าข้อความนี้ reply ข้อความอื่น ให้ AI เห็นข้อความ/รูปนั้นด้วย
+        quote, quoted_attachments = await self._replied_context(message)
+        attachments = [*message.attachments, *quoted_attachments]
+        has_image = self.config.max_images > 0 and any(map(is_image, attachments))
+        if not question and not has_image and not quote:
             # ในห้องคุยกับ AI ข้อความที่มีแต่สติกเกอร์/ไฟล์อื่น ให้ข้ามไปเงียบ ๆ
             if not in_ai_channel:
                 await message.reply("สวัสดี! พิมพ์คำถามต่อจากการ mention ได้เลย หรือใช้ `/ask` ก็ได้ 😊")
@@ -309,20 +332,23 @@ class AIChatBot(discord.Client):
         images: list[ImageData] = []
         if has_image:
             images, skipped = await read_images(
-                message.attachments, self.config.max_images, self.config.max_image_bytes
+                attachments, self.config.max_images, self.config.max_image_bytes
             )
             if skipped:
                 await message.reply(
                     "📷 ข้ามรูปเหล่านี้: " + ", ".join(skipped), delete_after=20,
                     allowed_mentions=REPLY_MENTIONS,
                 )
-            if not images and not question:
+            if not images and not question and not quote:
                 return
 
+        if not question:
+            question = IMAGE_ONLY_QUESTION if images and not quote else REPLY_ONLY_QUESTION
         ctx = AnswerContext(
             channel=message.channel, channel_id=message.channel.id,
             asker_id=message.author.id, asker_name=message.author.display_name,
-            question=question or IMAGE_ONLY_QUESTION, images=tuple(images), header="",
+            question=f"{quote}\n{question}" if quote else question,
+            images=tuple(images), header="",
         )
         await self._react(message, REACT_THINKING)
         # แสดง "กำลังพิมพ์..." ระหว่างรอ AI
@@ -332,6 +358,37 @@ class AIChatBot(discord.Client):
         if not ctx.ok:
             await self._react(message, REACT_ERROR)
         await self._deliver(ctx, self._channel_sender(message.channel, reply_to=message))
+
+    async def _replied_context(
+        self, message: discord.Message
+    ) -> tuple[str, list[discord.Attachment]]:
+        """ข้อความ + รูปของข้อความที่ถูก reply (ข้ามถ้าเป็นข้อความของบอทเอง เพราะอยู่ในความจำแล้ว)"""
+        ref = message.reference
+        if ref is None or ref.message_id is None:
+            return "", []
+        replied = ref.resolved if isinstance(ref.resolved, discord.Message) else None
+        if replied is None:
+            try:
+                replied = await message.channel.fetch_message(ref.message_id)
+            except discord.HTTPException:
+                return "", []
+        if self.user is not None and replied.author.id == self.user.id:
+            return "", []
+
+        parts = [replied.content.strip()]
+        # ข้อความจากบอทอื่นมักอยู่ใน embed
+        for embed in replied.embeds[:2]:
+            parts += [embed.title or "", embed.description or ""]
+        text = "\n".join(p for p in parts if p)[:1500]
+        images = [a for a in replied.attachments if is_image(a)]
+        if not text and not images:
+            return "", []
+        who = replied.author.display_name
+        quote = (
+            f'[ข้อความที่ถูกตอบกลับ จาก {who}]: "{text}"' if text
+            else f"[รูปที่ถูกตอบกลับ จาก {who}]"
+        )
+        return quote, images
 
     async def _react(self, message: discord.Message, emoji: str) -> None:
         # ต้องมีสิทธิ์ Add Reactions + Read Message History ถ้าไม่มีก็ข้ามไปเงียบ ๆ

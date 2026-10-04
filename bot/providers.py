@@ -20,6 +20,7 @@ import aiohttp
 
 from .config import Config
 from .memory import ChatMessage
+from .utils import now_text
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,14 @@ class ImageData:
 
     def b64(self) -> str:
         return base64.b64encode(self.data).decode("ascii")
+
+
+@dataclass(frozen=True)
+class AIResult:
+    text: str
+    model: str  # โมเดลที่ตอบจริง (อาจเป็นโมเดลสำรอง)
+    sources: tuple[tuple[str, str], ...] = ()  # (ชื่อเว็บ, ลิงก์) จากการค้นเว็บ
+    searched: bool = False
 
 
 class AIError(Exception):
@@ -57,6 +66,10 @@ class AITimeoutError(AIError):
 
 class AIBlockedError(AIError):
     user_message = "🚫 AI ปฏิเสธที่จะตอบคำถามนี้ (ถูกตัวกรองความปลอดภัยบล็อก) ลองเปลี่ยนคำถามดูนะ"
+
+
+class BadRequestError(AIError):
+    """HTTP 400 — คำขอไม่ถูกต้อง (เช่น โมเดลไม่รองรับฟีเจอร์ที่ขอ)"""
 
 
 class ServiceUnavailableError(AIError):
@@ -89,7 +102,9 @@ class AIProvider(ABC):
         self.models = list(dict.fromkeys((config.model, *config.fallback_models)))
         self.max_retries = config.max_retries
         self.system_prompt = config.system_prompt
+        self.timezone = config.timezone
         self.temperature = config.temperature
+        self.web_search = config.web_search
         self._timeout = aiohttp.ClientTimeout(total=config.ai_timeout)
         self._session: aiohttp.ClientSession | None = None
 
@@ -124,6 +139,9 @@ class AIProvider(ABC):
                         self.name, resp.status, model, (await resp.text())[:300],
                     )
                     raise ServiceUnavailableError(f"HTTP {resp.status}")
+                if resp.status == 400:
+                    log.error("%s HTTP 400 (model %s): %s", self.name, model, (await resp.text())[:500])
+                    raise BadRequestError("HTTP 400")
                 if resp.status >= 400:
                     body = await resp.text()
                     log.error("%s HTTP %s: %s", self.name, resp.status, body[:500])
@@ -135,9 +153,14 @@ class AIProvider(ABC):
             log.error("%s connection error: %r", self.name, e)
             raise AIError("connection error") from e
 
+    def build_system_prompt(self) -> str:
+        """system prompt + วันเวลาปัจจุบัน (AI ไม่รู้วันที่เองจึงคำนวณระยะเวลาผิดถ้าไม่บอก)"""
+        now = f"ข้อมูลอ้างอิง: ตอนนี้คือ{now_text(self.timezone)} ใช้ข้อมูลนี้เมื่อต้องคำนวณวันเวลา"
+        return f"{self.system_prompt}\n\n{now}" if self.system_prompt else now
+
     async def generate(
         self, history: list[ChatMessage], prompt: str, images: Sequence[ImageData] = ()
-    ) -> str:
+    ) -> AIResult:
         """รับประวัติบทสนทนา + คำถามใหม่ (+ รูปถ้ามี) คืนข้อความคำตอบ
 
         - เซิร์ฟเวอร์ล่มชั่วคราว (5xx): ลองซ้ำกับโมเดลเดิม โดยรอนานขึ้นเรื่อย ๆ (1, 2, 4 ... วินาที)
@@ -171,7 +194,7 @@ class AIProvider(ABC):
         history: list[ChatMessage],
         prompt: str,
         images: Sequence[ImageData],
-    ) -> str:
+    ) -> AIResult:
         """เรียก API หนึ่งครั้งด้วยโมเดลที่กำหนด คืนข้อความคำตอบ"""
 
 
@@ -179,13 +202,18 @@ class GeminiProvider(AIProvider):
     name = "gemini"
     BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        # โมเดลที่ใช้ค้นเว็บไม่ได้ (ตอบ 400) จะไม่ขอค้นเว็บอีกจนกว่าจะรีสตาร์ท
+        self._no_search_models: set[str] = set()
+
     async def _generate(
         self,
         model: str,
         history: list[ChatMessage],
         prompt: str,
         images: Sequence[ImageData],
-    ) -> str:
+    ) -> AIResult:
         contents = [
             {
                 "role": "model" if m.role == "assistant" else "user",
@@ -202,17 +230,25 @@ class GeminiProvider(AIProvider):
         payload: dict = {
             "contents": contents,
             "generationConfig": {"temperature": self.temperature},
+            "systemInstruction": {"parts": [{"text": self.build_system_prompt()}]},
         }
-        if self.system_prompt:
-            payload["systemInstruction"] = {"parts": [{"text": self.system_prompt}]}
+        search = self.web_search and model not in self._no_search_models
+        if search:
+            # ให้ Gemini ตัดสินใจเองว่าจะค้น Google ไหม (ค้นเฉพาะคำถามที่ต้องใช้ข้อมูลล่าสุด)
+            payload["tools"] = [{"google_search": {}}]
 
-        data = await self._post_json(
-            f"{self.BASE_URL}/{model}:generateContent",
-            payload,
-            # ส่ง key ทาง header แทน query string เพื่อไม่ให้ key หลุดไปใน log ของ URL
-            {"x-goog-api-key": self.api_key},
-            model,
-        )
+        url = f"{self.BASE_URL}/{model}:generateContent"
+        # ส่ง key ทาง header แทน query string เพื่อไม่ให้ key หลุดไปใน log ของ URL
+        headers = {"x-goog-api-key": self.api_key}
+        try:
+            data = await self._post_json(url, payload, headers, model)
+        except BadRequestError:
+            if not search:
+                raise
+            log.warning("Gemini %s ใช้ค้นเว็บไม่ได้ จะตอบแบบไม่ค้นเว็บแทน", model)
+            self._no_search_models.add(model)
+            payload.pop("tools")
+            data = await self._post_json(url, payload, headers, model)
 
         if block := data.get("promptFeedback", {}).get("blockReason"):
             log.warning("Gemini blocked prompt: %s", block)
@@ -228,7 +264,16 @@ class GeminiProvider(AIProvider):
             if candidate.get("finishReason") in ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"):
                 raise AIBlockedError(candidate["finishReason"])
             raise AIError(f"empty response (finishReason={candidate.get('finishReason')})")
-        return text
+
+        grounding = candidate.get("groundingMetadata") or {}
+        sources: list[tuple[str, str]] = []
+        for chunk in grounding.get("groundingChunks") or []:
+            web = chunk.get("web") or {}
+            if (uri := web.get("uri")) and all(uri != u for _, u in sources):
+                sources.append((web.get("title") or "ลิงก์", uri))
+        return AIResult(
+            text, model, tuple(sources), searched=bool(grounding.get("webSearchQueries"))
+        )
 
 
 class OpenAICompatibleProvider(AIProvider):
@@ -245,10 +290,9 @@ class OpenAICompatibleProvider(AIProvider):
         history: list[ChatMessage],
         prompt: str,
         images: Sequence[ImageData],
-    ) -> str:
+    ) -> AIResult:
         messages: list[dict] = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
+        messages.append({"role": "system", "content": self.build_system_prompt()})
         messages += [{"role": m.role, "content": m.content} for m in history]
         if images:
             # ต้องใช้โมเดลที่รองรับรูป (vision) ไม่งั้น API จะตอบ error กลับมา
@@ -284,7 +328,7 @@ class OpenAICompatibleProvider(AIProvider):
             raise AIError("unexpected response format") from e
         if not text:
             raise AIError("empty response")
-        return text
+        return AIResult(text, model)
 
 
 class GroqProvider(OpenAICompatibleProvider):
