@@ -30,6 +30,9 @@ class AnswerContext:
     question: str
     images: tuple[ImageData, ...]
     header: str  # ข้อความนำหน้าคำตอบ (เช่น คำถามของ /ask)
+    guild_id: int | None = None
+    exempt: bool = False  # แอดมิน ไม่ถูกจำกัดโควต้ารายวัน
+    search_query: str = ""  # ข้อความที่ผู้ใช้พิมพ์จริง ใช้ตัดสินใจ/ค้นเว็บ (ว่าง = ไม่ค้น)
     ok: bool = False
     prompt: str = ""
     answer: str = ""

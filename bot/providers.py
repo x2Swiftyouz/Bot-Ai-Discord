@@ -107,7 +107,8 @@ class AIProvider(ABC):
         self.system_prompt = config.system_prompt
         self.timezone = config.timezone
         self.temperature = config.temperature
-        self.web_search = config.web_search
+        # มี Tavily แล้วไม่ต้องใช้ค้นเว็บของ Gemini (ซึ่ง free tier มักไม่มีโควต้า)
+        self.web_search = config.web_search and not config.tavily_api_key
         self._timeout = aiohttp.ClientTimeout(total=config.ai_timeout)
         self._session: aiohttp.ClientSession | None = None
         # (ลำดับ key, โมเดล) ที่เกินโควต้า -> เวลาที่จะลองใช้ได้อีก

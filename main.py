@@ -11,6 +11,9 @@ import re
 import sys
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import replace
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -22,7 +25,9 @@ from bot.cooldown import UserCooldown
 from bot.media import is_image, read_images
 from bot.memory import ChannelMemory
 from bot.providers import AIError, AIProvider, BackupProvider, ImageData, create_provider
-from bot.utils import redact, split_message
+from bot.search import SearchError, TavilySearch, format_results, should_search
+from bot.storage import Database
+from bot.utils import now_text, redact, split_message
 from bot.views import AnswerContext, AnswerView
 
 logging.basicConfig(
@@ -75,7 +80,9 @@ class AIChatBot(discord.Client):
 
         self.config = config
         self.tree = app_commands.CommandTree(self)
-        self.memory = ChannelMemory(config.memory_size)
+        self.db = Database(config.data_dir / "bot.db")
+        self.memory = ChannelMemory(config.memory_size, self.db if config.memory_persist else None)
+        self.search = TavilySearch(config.tavily_api_key) if config.tavily_api_key else None
         self.cooldown = UserCooldown(config.user_cooldown)
         self.ai_channels = AIChannelStore(
             config.ai_channel_ids, config.data_dir / "ai_channels.json"
@@ -162,37 +169,68 @@ class AIChatBot(discord.Client):
 
     async def close(self) -> None:
         await self.ai.close()
+        if self.search:
+            await self.search.close()
         await super().close()
+        self.db.close()
 
     # ---------- core ----------
 
-    async def ask_ai(
-        self, channel_id: int, author: str, question: str, images: Sequence[ImageData] = ()
-    ) -> tuple[bool, str, str, str]:
-        """ส่งคำถามไปยัง AI พร้อมบริบทของช่อง
+    def _today(self) -> str:
+        return datetime.now(ZoneInfo(self.config.timezone)).strftime("%Y-%m-%d")
 
-        คืน (สำเร็จไหม, คำตอบหรือข้อความแจ้ง error, ข้อความที่บันทึกลงความจำ, บรรทัดเล็กใต้คำตอบ)
-        """
+    async def ask_ai(self, ctx: AnswerContext) -> None:
+        """ส่งคำถามไปยัง AI พร้อมบริบทของช่อง (+ ผลค้นเว็บถ้าต้องใช้) แล้วเก็บผลลัพธ์ลง ctx"""
         # ใส่ชื่อผู้ถาม เพราะในช่องเดียวอาจมีหลายคนคุยกับบอท
-        prompt = f"{author}: {question}"
-        # ความจำเก็บแค่ข้อความ ไม่เก็บรูป (ประหยัดโควต้า) จึงจดไว้ว่ามีรูปแนบ
-        memory_text = prompt + (f" [แนบรูป {len(images)} รูป]" if images else "")
-        async with self.memory.lock(channel_id):
-            history = self.memory.get(channel_id)
+        prompt = f"{ctx.asker_name}: {ctx.question}"
+        # ความจำเก็บแค่คำถาม ไม่เก็บรูปหรือผลค้นเว็บ (ประหยัดโควต้า) จึงจดไว้ว่ามีรูปแนบ
+        ctx.prompt = prompt + (f" [แนบรูป {len(ctx.images)} รูป]" if ctx.images else "")
+        ctx.footer = ""
+        async with self.memory.lock(ctx.channel_id):
+            history = self.memory.get(ctx.channel_id)
             started = time.monotonic()
+            sources: tuple[tuple[str, str], ...] = ()
+            if self.search and ctx.search_query and should_search(ctx.search_query):
+                try:
+                    found = await self.search.search(ctx.search_query)
+                except SearchError as e:
+                    log.warning("ค้นเว็บไม่สำเร็จ ตอบแบบไม่ค้นเว็บแทน: %s", e)
+                    found = []
+                if found:
+                    prompt += "\n\n" + format_results(found, now_text(self.config.timezone))
+                    sources = tuple((r.title, r.url) for r in found)
             try:
-                result = await self.ai.generate(history, prompt, images)
+                result = await self.ai.generate(history, prompt, ctx.images)
             except AIError as e:
-                log.warning("AI error in channel %s: %r", channel_id, e)
-                return False, e.user_message, memory_text, ""
+                log.warning("AI error in channel %s: %r", ctx.channel_id, e)
+                ctx.ok, ctx.answer = False, e.user_message
             except Exception:
                 log.exception("Unexpected error while calling AI")
-                return False, "⚠️ เกิดข้อผิดพลาดที่ไม่คาดคิด ลองใหม่อีกครั้งนะ", memory_text, ""
-            self.memory.add_exchange(channel_id, memory_text, result.text)
-            self.answer_count += 1
-            return True, result.text, memory_text, self._footer(result, time.monotonic() - started)
+                ctx.ok, ctx.answer = False, "⚠️ เกิดข้อผิดพลาดที่ไม่คาดคิด ลองใหม่อีกครั้งนะ"
+            else:
+                if sources:
+                    result = replace(result, sources=sources, searched=True)
+                ctx.ok, ctx.answer = True, result.text
+                self.memory.add_exchange(ctx.channel_id, ctx.prompt, result.text)
+                self.answer_count += 1
+        elapsed = time.monotonic() - started
+        self.db.record_usage(
+            day=self._today(), guild_id=ctx.guild_id, user_id=ctx.asker_id,
+            user_name=ctx.asker_name, ok=ctx.ok,
+            model=result.model if ctx.ok else None,
+            backup=ctx.ok and result.backup, searched=ctx.ok and result.searched,
+            elapsed=elapsed,
+        )
+        if ctx.ok:
+            ctx.footer = self._footer(result, elapsed, self._remaining(ctx))
 
-    def _footer(self, result, elapsed: float) -> str:
+    def _remaining(self, ctx: AnswerContext) -> int | None:
+        """จำนวนคำถามที่เหลือวันนี้ (None = ไม่จำกัด)"""
+        if not self.config.daily_limit or ctx.exempt:
+            return None
+        return max(0, self.config.daily_limit - self.db.used_today(self._today(), ctx.asker_id))
+
+    def _footer(self, result, elapsed: float, remaining: int | None = None) -> str:
         """บรรทัดตัวเล็ก (-#) ใต้คำตอบ: เวลาที่ใช้ · โมเดล · แหล่งที่มาจากการค้นเว็บ"""
         if not self.config.show_footer:
             return ""
@@ -207,13 +245,13 @@ class AIChatBot(discord.Client):
                 f"[{title[:40]}](<{uri}>)" for title, uri in result.sources[:MAX_SOURCES]
             )
             info += f"\n-# 📚 แหล่งที่มา: {links}"
+        if remaining is not None and remaining <= 5:
+            info += f"\n-# 📊 เหลือ {remaining} คำถามสำหรับวันนี้"
         return info
 
     async def _run(self, ctx: AnswerContext) -> None:
         """ถาม AI ตามข้อมูลใน ctx แล้วเก็บผลลัพธ์กลับลง ctx"""
-        ctx.ok, ctx.answer, ctx.prompt, ctx.footer = await self.ask_ai(
-            ctx.channel_id, ctx.asker_name, ctx.question, ctx.images
-        )
+        await self.ask_ai(ctx)
 
     def _chunks(self, ctx: AnswerContext) -> list[str]:
         text = ctx.header + ctx.answer + (f"\n{ctx.footer}" if ctx.footer else "")
@@ -268,7 +306,7 @@ class AIChatBot(discord.Client):
                 pass
 
     async def regenerate_answer(self, interaction: discord.Interaction, view: AnswerView) -> None:
-        if wait_msg := self._cooldown_message(interaction.user.id):
+        if wait_msg := self._limit_message(interaction.user):
             await interaction.response.send_message(wait_msg, ephemeral=True)
             return
         view.busy = True
@@ -302,7 +340,7 @@ class AIChatBot(discord.Client):
                 view.message = msg
 
     async def continue_answer(self, interaction: discord.Interaction, view: AnswerView) -> None:
-        if wait_msg := self._cooldown_message(interaction.user.id):
+        if wait_msg := self._limit_message(interaction.user):
             await interaction.response.send_message(wait_msg, ephemeral=True)
             return
         view.busy = True
@@ -323,6 +361,7 @@ class AIChatBot(discord.Client):
         ctx = AnswerContext(
             channel=old.channel, channel_id=old.channel_id, asker_id=old.asker_id,
             asker_name=old.asker_name, question=CONTINUE_QUESTION, images=(), header="",
+            guild_id=old.guild_id, exempt=old.exempt,
         )
         async with ctx.channel.typing():
             await self._run(ctx)
@@ -335,6 +374,22 @@ class AIChatBot(discord.Client):
             self.memory.remove_exchange(ctx.channel_id, ctx.prompt, ctx.answer)
         view.stop()
         await self._delete_messages(ctx, ctx.message_ids)
+
+    @staticmethod
+    def _is_exempt(user: discord.abc.User) -> bool:
+        """แอดมิน (Administrator / Manage Server) ไม่ถูกจำกัดโควต้ารายวัน"""
+        if not isinstance(user, discord.Member):
+            return False
+        perms = user.guild_permissions
+        return perms.administrator or perms.manage_guild
+
+    def _limit_message(self, user: discord.abc.User) -> str | None:
+        """เช็กโควต้ารายวันก่อน แล้วค่อยเช็ก cooldown คืนข้อความแจ้งผู้ใช้ถ้าถามไม่ได้"""
+        limit = self.config.daily_limit
+        if limit and not self._is_exempt(user):
+            if self.db.used_today(self._today(), user.id) >= limit:
+                return f"📊 วันนี้คุณถามครบ {limit} คำถามแล้ว โควต้าจะรีเซ็ตตอนเที่ยงคืน แล้วเจอกันพรุ่งนี้นะ 🙏"
+        return self._cooldown_message(user.id)
 
     def _cooldown_message(self, user_id: int) -> str | None:
         remaining = self.cooldown.check(user_id)
@@ -378,7 +433,7 @@ class AIChatBot(discord.Client):
                 await message.reply("สวัสดี! พิมพ์คำถามต่อจากการ mention ได้เลย หรือใช้ `/ask` ก็ได้ 😊")
             return
 
-        if wait_msg := self._cooldown_message(message.author.id):
+        if wait_msg := self._limit_message(message.author):
             await message.reply(wait_msg, delete_after=10)
             return
 
@@ -395,6 +450,7 @@ class AIChatBot(discord.Client):
             if not images and not question and not quote:
                 return
 
+        typed = question
         if not question:
             question = IMAGE_ONLY_QUESTION if images and not quote else REPLY_ONLY_QUESTION
         ctx = AnswerContext(
@@ -402,6 +458,8 @@ class AIChatBot(discord.Client):
             asker_id=message.author.id, asker_name=message.author.display_name,
             question=f"{quote}\n{question}" if quote else question,
             images=tuple(images), header="",
+            guild_id=message.guild.id if message.guild else None,
+            exempt=self._is_exempt(message.author), search_query=typed,
         )
         await self._react(message, REACT_THINKING)
         # แสดง "กำลังพิมพ์..." ระหว่างรอ AI
@@ -468,7 +526,7 @@ class AIChatBot(discord.Client):
             question: str,
             image: discord.Attachment | None = None,
         ) -> None:
-            if wait_msg := self._cooldown_message(interaction.user.id):
+            if wait_msg := self._limit_message(interaction.user):
                 await interaction.response.send_message(wait_msg, ephemeral=True)
                 return
 
@@ -494,6 +552,8 @@ class AIChatBot(discord.Client):
                 channel_id=interaction.channel_id or interaction.user.id,
                 asker_id=interaction.user.id, asker_name=interaction.user.display_name,
                 question=question, images=tuple(images), header=header,
+                guild_id=interaction.guild_id, exempt=self._is_exempt(interaction.user),
+                search_query=question,
             )
             await self._run(ctx)
             await self._deliver(ctx, self._followup_sender(interaction))
@@ -561,6 +621,27 @@ class AIChatBot(discord.Client):
                     ephemeral=True,
                 )
 
+        @self.tree.command(name="usage", description="ดูว่าวันนี้ถาม AI ไปแล้วกี่ครั้ง")
+        async def usage(interaction: discord.Interaction) -> None:
+            used = self.db.used_today(self._today(), interaction.user.id)
+            limit = self.config.daily_limit
+            if not limit or self._is_exempt(interaction.user):
+                text = f"📊 วันนี้คุณถามไปแล้ว **{used}** ครั้ง (ไม่จำกัดจำนวน)"
+            else:
+                text = (
+                    f"📊 วันนี้คุณถามไปแล้ว **{used}/{limit}** ครั้ง "
+                    f"เหลืออีก **{max(0, limit - used)}** ครั้ง (รีเซ็ตตอนเที่ยงคืน)"
+                )
+            await interaction.response.send_message(text, ephemeral=True)
+
+        @self.tree.command(name="stats", description="สถิติการใช้งานบอท AI (สำหรับแอดมิน)")
+        @app_commands.guild_only()
+        @app_commands.default_permissions(manage_guild=True)
+        async def stats(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message(
+                embed=self._stats_embed(interaction.guild_id), ephemeral=True
+            )
+
         @self.tree.command(name="help", description="วิธีใช้บอท AI")
         async def help_(interaction: discord.Interaction) -> None:
             await interaction.response.send_message(embed=self._welcome_embed(), ephemeral=True)
@@ -579,6 +660,51 @@ class AIChatBot(discord.Client):
             except discord.HTTPException:
                 pass
 
+
+    def _stats_embed(self, guild_id: int | None) -> discord.Embed:
+        today = self._today()
+        s = self.db.day_stats(today, guild_id)
+        embed = discord.Embed(title="📈 สถิติบอท AI วันนี้", color=BRAND_COLOR)
+        embed.add_field(name="💬 คำตอบ", value=f"**{s.answers:,}**", inline=True)
+        embed.add_field(name="👥 ผู้ใช้", value=f"**{s.users:,}** คน", inline=True)
+        embed.add_field(name="⚡ เวลาเฉลี่ย", value=f"**{s.avg_elapsed:.1f}** วิ", inline=True)
+        embed.add_field(name="⚠️ error", value=f"{s.errors:,}", inline=True)
+        embed.add_field(name="🛟 ใช้ตัวสำรอง", value=f"{s.backup:,}", inline=True)
+        embed.add_field(name="🔎 ค้นเว็บ", value=f"{s.searched:,}", inline=True)
+
+        top = self.db.top_users(today, guild_id)
+        medals = ["🥇", "🥈", "🥉", "4.", "5."]
+        embed.add_field(
+            name="🏆 ถามมากที่สุดวันนี้",
+            value="\n".join(f"{medals[i]} {name} — {n}" for i, (name, n) in enumerate(top))
+            or "ยังไม่มี",
+            inline=False,
+        )
+        models = self.db.models_used(today, guild_id)
+        embed.add_field(
+            name="🤖 โมเดลที่ตอบ",
+            value="\n".join(f"`{m}` — {n}" for m, n in models) or "ยังไม่มี",
+            inline=False,
+        )
+        # กราฟแท่งเล็ก ๆ ของ 7 วันล่าสุด
+        now = datetime.now(ZoneInfo(self.config.timezone))
+        days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
+        totals = self.db.daily_totals(days, guild_id)
+        peak = max((n for _, n in totals), default=0) or 1
+        bars = "▁▂▃▄▅▆▇█"
+        chart = "".join(bars[min(7, round(n / peak * 7))] for _, n in totals)
+        week = sum(n for _, n in totals)
+        embed.add_field(
+            name="📅 7 วันล่าสุด", value=f"`{chart}`  รวม **{week:,}** คำตอบ", inline=False
+        )
+        limit = self.config.daily_limit
+        quota = f"{limit} คำถาม/คน/วัน" if limit else "ไม่จำกัด"
+        backup = self.config.backup_provider or "ไม่มี"
+        search = "Tavily" if self.config.tavily_api_key else ("Gemini" if self.config.web_search else "ปิด")
+        embed.set_footer(
+            text=f"AI: {self.config.provider} · สำรอง: {backup} · ค้นเว็บ: {search} · โควต้า: {quota}"
+        )
+        return embed
 
     def _welcome_embed(self) -> discord.Embed:
         embed = discord.Embed(
