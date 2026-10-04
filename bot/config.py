@@ -115,6 +115,9 @@ class Config:
     system_prompt: str
     timezone: str
     web_search: bool
+    tavily_api_key: str
+    memory_persist: bool
+    daily_limit: int
     show_footer: bool
     memory_size: int
     max_images: int
@@ -194,6 +197,9 @@ class Config:
             ).strip(),
             timezone=timezone,
             web_search=_get_bool("WEB_SEARCH", True),
+            tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip(),
+            memory_persist=_get_bool("MEMORY_PERSIST", True),
+            daily_limit=max(0, _get_int("DAILY_LIMIT_PER_USER", 30)),
             show_footer=_get_bool("SHOW_FOOTER", True),
             memory_size=max(1, _get_int("MEMORY_SIZE", 10)),
             max_images=max(0, _get_int("MAX_IMAGES", 4)),
