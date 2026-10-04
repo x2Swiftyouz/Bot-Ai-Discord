@@ -10,8 +10,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import aiohttp
 
@@ -19,6 +22,17 @@ from .config import Config
 from .memory import ChatMessage
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ImageData:
+    """รูปที่แนบมากับคำถาม (ส่งให้ AI เฉพาะคำถามปัจจุบัน ไม่เก็บลงความจำ)"""
+
+    mime_type: str
+    data: bytes
+
+    def b64(self) -> str:
+        return base64.b64encode(self.data).decode("ascii")
 
 
 class AIError(Exception):
@@ -121,8 +135,10 @@ class AIProvider(ABC):
             log.error("%s connection error: %r", self.name, e)
             raise AIError("connection error") from e
 
-    async def generate(self, history: list[ChatMessage], prompt: str) -> str:
-        """รับประวัติบทสนทนา + คำถามใหม่ คืนข้อความคำตอบ
+    async def generate(
+        self, history: list[ChatMessage], prompt: str, images: Sequence[ImageData] = ()
+    ) -> str:
+        """รับประวัติบทสนทนา + คำถามใหม่ (+ รูปถ้ามี) คืนข้อความคำตอบ
 
         - เซิร์ฟเวอร์ล่มชั่วคราว (5xx): ลองซ้ำกับโมเดลเดิม โดยรอนานขึ้นเรื่อย ๆ (1, 2, 4 ... วินาที)
         - ล่มต่อเนื่อง / เกินโควต้า (429) / ไม่พบโมเดล (404): ข้ามไปโมเดลสำรองถัดไป
@@ -133,7 +149,7 @@ class AIProvider(ABC):
         for model in self.models:
             for attempt in range(self.max_retries + 1):
                 try:
-                    return await self._generate(model, history, prompt)
+                    return await self._generate(model, history, prompt, images)
                 except ServiceUnavailableError as e:
                     last_error = e
                     if attempt < self.max_retries:
@@ -149,7 +165,13 @@ class AIProvider(ABC):
         raise last_error
 
     @abstractmethod
-    async def _generate(self, model: str, history: list[ChatMessage], prompt: str) -> str:
+    async def _generate(
+        self,
+        model: str,
+        history: list[ChatMessage],
+        prompt: str,
+        images: Sequence[ImageData],
+    ) -> str:
         """เรียก API หนึ่งครั้งด้วยโมเดลที่กำหนด คืนข้อความคำตอบ"""
 
 
@@ -157,7 +179,13 @@ class GeminiProvider(AIProvider):
     name = "gemini"
     BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
-    async def _generate(self, model: str, history: list[ChatMessage], prompt: str) -> str:
+    async def _generate(
+        self,
+        model: str,
+        history: list[ChatMessage],
+        prompt: str,
+        images: Sequence[ImageData],
+    ) -> str:
         contents = [
             {
                 "role": "model" if m.role == "assistant" else "user",
@@ -165,7 +193,11 @@ class GeminiProvider(AIProvider):
             }
             for m in history
         ]
-        contents.append({"role": "user", "parts": [{"text": prompt}]})
+        parts: list[dict] = [
+            {"inline_data": {"mime_type": img.mime_type, "data": img.b64()}} for img in images
+        ]
+        parts.append({"text": prompt})
+        contents.append({"role": "user", "parts": parts})
 
         payload: dict = {
             "contents": contents,
@@ -207,12 +239,29 @@ class OpenAICompatibleProvider(AIProvider):
     def extra_headers(self) -> dict:
         return {}
 
-    async def _generate(self, model: str, history: list[ChatMessage], prompt: str) -> str:
+    async def _generate(
+        self,
+        model: str,
+        history: list[ChatMessage],
+        prompt: str,
+        images: Sequence[ImageData],
+    ) -> str:
         messages: list[dict] = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
         messages += [{"role": m.role, "content": m.content} for m in history]
-        messages.append({"role": "user", "content": prompt})
+        if images:
+            # ต้องใช้โมเดลที่รองรับรูป (vision) ไม่งั้น API จะตอบ error กลับมา
+            content: str | list[dict] = [{"type": "text", "text": prompt}] + [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{img.mime_type};base64,{img.b64()}"},
+                }
+                for img in images
+            ]
+        else:
+            content = prompt
+        messages.append({"role": "user", "content": content})
 
         data = await self._post_json(
             self.url,
