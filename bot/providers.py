@@ -655,8 +655,27 @@ def error_reason(error: AIError) -> str:
     return next((text for cls, text in _ERROR_REASONS if isinstance(error, cls)), "error")
 
 
-# แจ้งเหตุการณ์สำคัญออกไปข้างนอก (เช่น ห้อง log ของแอดมิน): (key สำหรับกันแจ้งซ้ำ, ข้อความ)
-EventHook = Callable[[str, str], None]
+# แจ้งการเปลี่ยนสถานะของ AI ออกไปข้างนอก (ห้อง log ของแอดมิน): (ชนิด, หัวข้อ, รายละเอียด)
+# ชนิด: "down" ใช้ไม่ได้ · "up" กลับมาใช้ได้ · "outage" ใช้ไม่ได้ทุกตัว · "recovered" กลับมาตอบได้
+EventHook = Callable[[str, str, str], None]
+
+
+def format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} วินาที"
+    minutes, _ = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} ชม. {minutes} นาที" if minutes else f"{hours} ชม."
+    return f"{minutes} นาที"
+
+
+@dataclass
+class _Health:
+    down_since: float | None = None
+    reason: str = ""
+    covered: int = 0  # จำนวนคำตอบที่เจ้าอื่นตอบแทนระหว่างที่เจ้านี้ใช้ไม่ได้
 
 
 class BackupProvider:
@@ -665,25 +684,51 @@ class BackupProvider:
     - เจ้าที่โดน 429 จะถูกพักไว้ชั่วครู่ คำถามช่วงนั้นข้ามไปเจ้าถัดไปเลย (ไม่ต้องรอ error ทุกครั้ง)
     - ข้อความธรรมดา: ไม่ลองซ้ำเมื่อเซิร์ฟเวอร์ล่ม เพราะมีเจ้าถัดไปตอบแทนได้ทันที
     - ข้อความที่มีรูป: ลองซ้ำก่อน และถ้าเจ้าไหนอ่านรูปไม่ได้ (400) ก็ไปเจ้าถัดไป
+    - ติดตามสถานะของแต่ละเจ้า แล้วแจ้งเฉพาะตอนเปลี่ยนสถานะ (ล่ม → กลับมา) ไม่แจ้งทุกคำถาม
     """
 
     # ไม่ใช้ตัวสำรองเมื่อคำถามถูกตัวกรองความปลอดภัยบล็อก
     NO_BACKUP_ERRORS = (AIBlockedError,)
+    # error ที่ไม่ได้แปลว่าเจ้านั้น "ล่ม" (เช่น 400 = โมเดลอ่านรูปไม่ได้) จึงไม่เปลี่ยนสถานะ
+    NOT_AN_OUTAGE = (BadRequestError,)
     MIN_PAUSE_SECONDS = 60
 
     def __init__(self, primary: AIProvider, backups: Sequence[AIProvider]) -> None:
         self.primary = primary
         self.backups = list(backups)
         self._paused_until: dict[str, float] = {}
+        self._health: dict[str, _Health] = {p.name: _Health() for p in (primary, *backups)}
+        self._outage_since: float | None = None
         self.on_event: EventHook | None = None
 
     @property
     def backup(self) -> AIProvider:
         return self.backups[0]
 
-    def _emit(self, key: str, message: str) -> None:
+    def _emit(self, kind: str, title: str, detail: str) -> None:
         if self.on_event is not None:
-            self.on_event(key, message)
+            self.on_event(kind, title, detail)
+
+    def _mark_down(self, provider: AIProvider, error: AIError) -> bool:
+        """คืน True ถ้าเพิ่งเปลี่ยนจากใช้ได้ → ใช้ไม่ได้"""
+        health = self._health[provider.name]
+        if health.down_since is not None:
+            return False
+        health.down_since, health.reason, health.covered = time.monotonic(), error_reason(error), 0
+        return True
+
+    def _mark_up(self, provider: AIProvider) -> None:
+        health = self._health[provider.name]
+        if health.down_since is None:
+            return
+        duration = format_duration(time.monotonic() - health.down_since)
+        covered = f" · ระหว่างนั้นตัวสำรองตอบแทน {health.covered:,} ครั้ง" if health.covered else ""
+        self._emit(
+            "up",
+            f"🟢 {provider.name} กลับมาใช้ได้แล้ว",
+            f"ใช้ไม่ได้ไป {duration} (สาเหตุ: {health.reason}){covered}",
+        )
+        health.down_since = None
 
     async def generate(
         self,
@@ -693,13 +738,13 @@ class BackupProvider:
         on_delta: OnDelta | None = None,
         retry: bool = True,
     ) -> AIResult:
-        chain = [self.primary, *self.backups]
+        all_providers = [self.primary, *self.backups]
         now = time.monotonic()
-        ready = [p for p in chain if self._paused_until.get(p.name, 0) <= now]
-        chain = ready or chain  # ถ้าพักไว้หมดทุกเจ้า ก็ลองทุกเจ้าอยู่ดี
+        ready = [p for p in all_providers if self._paused_until.get(p.name, 0) <= now]
+        chain = ready or all_providers  # ถ้าพักไว้หมดทุกเจ้า ก็ลองทุกเจ้าอยู่ดี
         first_error: AIError | None = None
-        # เจ้าที่ถูกข้ามเพราะพักอยู่ (เกินโควต้า) ก็นับเป็น "ใช้ไม่ได้" ในข้อความแจ้งเตือนด้วย
-        failed: list[str] = [f"{p.name} (พักอยู่ เกินโควต้า)" for p in [self.primary, *self.backups] if p not in chain]
+        newly_down: list[tuple[str, str]] = []  # (ชื่อ, สาเหตุ) ของเจ้าที่เพิ่งใช้ไม่ได้ในคำถามนี้
+        failed: list[str] = [f"{p.name} (พักอยู่ เกินโควต้า)" for p in all_providers if p not in chain]
         for i, provider in enumerate(chain):
             last = i == len(chain) - 1
             try:
@@ -711,6 +756,8 @@ class BackupProvider:
             except AIError as e:
                 first_error = first_error or e
                 failed.append(f"{provider.name} ({error_reason(e)})")
+                if not isinstance(e, self.NOT_AN_OUTAGE) and self._mark_down(provider, e):
+                    newly_down.append((provider.name, error_reason(e)))
                 if isinstance(e, RateLimitError):
                     pause = max(e.retry_after or 0, self.MIN_PAUSE_SECONDS)
                     self._paused_until[provider.name] = time.monotonic() + pause
@@ -718,17 +765,34 @@ class BackupProvider:
                 else:
                     log.warning("%s ใช้ไม่ได้: %r", provider.name, e)
                 continue
+
+            self._mark_up(provider)
+            if self._outage_since is not None:
+                duration = format_duration(time.monotonic() - self._outage_since)
+                self._emit("recovered", "✅ บอทกลับมาตอบได้แล้ว", f"ใช้ไม่ได้ทุกตัวอยู่ {duration} · ตอบด้วย **{provider.name}**")
+                self._outage_since = None
+            for other in all_providers:
+                health = self._health[other.name]
+                if other is not provider and health.down_since is not None:
+                    health.covered += 1
+            if newly_down:
+                reasons = " · ".join(f"**{name}** ({reason})" for name, reason in newly_down)
+                self._emit(
+                    "down",
+                    f"🔴 {', '.join(name for name, _ in newly_down)} ใช้ไม่ได้",
+                    f"{reasons} → สลับไปตอบด้วย **{provider.name}** (`{result.model}`)\n"
+                    "-# จะแจ้งอีกครั้งเมื่อกลับมาใช้ได้",
+                )
             if provider is self.primary:
                 return result
-            self._emit(
-                f"fallback:{','.join(failed)}->{provider.name}",
-                f"🛟 {' → '.join(failed)} ใช้ไม่ได้ → ตอบด้วย **{provider.name}** (`{result.model}`) แทน",
-            )
             return replace(result, backup=True)
-        self._emit(
-            f"allfail:{','.join(failed)}",
-            f"🔥 AI ทุกตัวใช้ไม่ได้: {' · '.join(failed)} — ผู้ใช้จะเห็นข้อความ error",
-        )
+
+        if self._outage_since is None:
+            self._outage_since = time.monotonic()
+            self._emit(
+                "outage", "🔥 AI ใช้ไม่ได้ทุกตัว",
+                f"{' · '.join(failed)}\nผู้ใช้จะเห็นข้อความ error จนกว่าจะมีตัวใดตัวหนึ่งกลับมา",
+            )
         assert first_error is not None
         # แจ้งผู้ใช้ด้วย error ของเจ้าแรกที่ลอง (สาเหตุแรก)
         raise first_error
