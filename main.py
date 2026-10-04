@@ -32,10 +32,10 @@ from bot.memory import ChannelMemory
 from bot.providers import (
     CURRENT_PERSONA, CURRENT_USER_NOTES, AIError, AIProvider, BackupProvider, ImageData, OnDelta, create_provider,
 )
-from bot.search import SearchError, TavilySearch, format_results, should_search
+from bot.search import SearchError, TavilySearch, format_results, is_video_query, should_search
 from bot.storage import Database
 from bot.streaming import StreamPreview
-from bot.utils import now_text, redact, split_message
+from bot.utils import now_text, redact, split_message, tables_to_lists
 from bot.views import AnswerContext, AnswerView, CloseThreadView
 
 logging.basicConfig(
@@ -72,6 +72,7 @@ IMAGE_ONLY_QUESTION = "ช่วยอธิบายรูปนี้หน่
 FILE_ONLY_QUESTION = "ช่วยสรุปไฟล์นี้หน่อย"
 REPLY_ONLY_QUESTION = "ช่วยอธิบายหรือตอบข้อความนี้หน่อย"
 MAX_SOURCES = 3
+MAX_VIDEO_LINKS = 5
 CONTINUE_QUESTION = "เขียนต่อจากคำตอบก่อนหน้าให้จบ ต่อจากจุดที่ค้างไว้เลย ไม่ต้องทวนซ้ำ"
 # ปุ่มคำถามแนะนำ: ชนิด -> (ป้ายบอกในคำตอบ, คำสั่งให้ AI) — ส่งคำตอบเดิมไปด้วย ไม่พึ่งความจำของห้อง
 FOLLOWUPS = {
@@ -261,6 +262,7 @@ class AIChatBot(discord.Client):
         if ctx.attachments_text:
             prompt += "\n\n" + ctx.attachments_text
         ctx.footer = ""
+        ctx.extras = ""
         # บุคลิกของห้อง (/persona) — ใช้แทน SYSTEM_PROMPT ระหว่างคำถามนี้
         persona_token = CURRENT_PERSONA.set(self._persona_prompt(ctx) if ctx.use_memory else None)
         # ข้อมูลที่ผู้ถามขอให้จำไว้ (/remember)
@@ -316,6 +318,13 @@ class AIChatBot(discord.Client):
                 if found:
                     prompt += "\n\n" + format_results(found, now_text(self.config.timezone))
                     sources = tuple((r.title, r.url) for r in found)
+                    if is_video_query(ctx.search_query):
+                        # AI มักบอกแค่ชื่อคลิป บอทจึงต่อท้ายลิงก์ให้กดได้เลย (<> กันพรีวิวใหญ่ท่วมห้อง)
+                        links = "\n".join(
+                            f"{i}. [{r.title[:80]}](<{r.url}>)"
+                            for i, r in enumerate(found[:MAX_VIDEO_LINKS], 1)
+                        )
+                        ctx.extras = f"\n\n🎬 **คลิปที่เจอ**\n{links}"
             try:
                 result = await self.ai.generate(history, prompt, ctx.images, on_delta)
             except AIError as e:
@@ -341,7 +350,9 @@ class AIChatBot(discord.Client):
             elapsed=elapsed,
         )
         if ctx.ok:
-            ctx.footer = self._footer(result, elapsed, self._remaining(ctx))
+            # มีรายการคลิปแล้ว ไม่ต้องแสดงแหล่งที่มาซ้ำ
+            shown = replace(result, sources=()) if ctx.extras else result
+            ctx.footer = self._footer(shown, elapsed, self._remaining(ctx))
 
     def _remaining(self, ctx: AnswerContext) -> int | None:
         """จำนวนคำถามที่เหลือวันนี้ (None = ไม่จำกัด)"""
@@ -389,18 +400,23 @@ class AIChatBot(discord.Client):
     def _render(
         self, ctx: AnswerContext, allow_file: bool = True
     ) -> tuple[list[str], discord.File | None]:
-        """แบ่งคำตอบเป็นข้อความ ถ้ายาวมาก (LONG_ANSWER_FILE_CHARS) แสดงส่วนต้น + แนบฉบับเต็มเป็นไฟล์ .txt"""
+        """แบ่งคำตอบเป็นข้อความ ถ้ายาวมาก (LONG_ANSWER_FILE_CHARS) แสดงส่วนต้น + แนบฉบับเต็มเป็นไฟล์ .txt
+
+        ตาราง Markdown ถูกแปลงเป็นรายการ เพราะ Discord แสดงตารางไม่ได้ (ไฟล์แนบเก็บตารางเดิมไว้)
+        """
         footer = f"\n{ctx.footer}" if ctx.footer else ""
+        answer = tables_to_lists(ctx.answer)
         limit = self.config.long_answer_file_chars
-        if allow_file and ctx.ok and limit and len(ctx.answer) > limit:
-            preview = split_message(ctx.answer, LONG_ANSWER_PREVIEW)[0]
+        if allow_file and ctx.ok and limit and len(answer) > limit:
+            preview = split_message(answer, LONG_ANSWER_PREVIEW)[0]
             text = (
                 f"{ctx.header}{preview}\n…\n"
-                f"-# 📄 คำตอบยาว {len(ctx.answer):,} ตัวอักษร — ฉบับเต็มอยู่ในไฟล์แนบ{footer}"
+                f"-# 📄 คำตอบยาว {len(ctx.answer):,} ตัวอักษร — ฉบับเต็มอยู่ในไฟล์แนบ{ctx.extras}{footer}"
             )
             file = discord.File(io.BytesIO(ctx.answer.encode("utf-8")), filename="answer.txt")
             return split_message(text), file
-        return split_message(ctx.header + ctx.answer + footer) or ["(AI ไม่ได้ส่งข้อความกลับมา)"], None
+        text = ctx.header + answer + ctx.extras + footer
+        return split_message(text) or ["(AI ไม่ได้ส่งข้อความกลับมา)"], None
 
     def _chunks(self, ctx: AnswerContext) -> list[str]:
         return self._render(ctx)[0]

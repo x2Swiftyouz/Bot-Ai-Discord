@@ -44,6 +44,10 @@ SHORT_QUERY = 25
 _NEWS = re.compile(r"ข่าว|\bnews\b", re.IGNORECASE)
 
 
+def is_video_query(question: str) -> bool:
+    return bool(_VIDEO.search(question))
+
+
 def should_search(question: str) -> bool:
     text = question.strip()
     if _FORCE_PREFIX.match(text) or _FIND_PREFIX.match(text):

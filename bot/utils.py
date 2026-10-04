@@ -94,3 +94,55 @@ def _unclosed_fence(chunk: str) -> str | None:
         if stripped.startswith(FENCE):
             opener = None if opener is not None else stripped
     return opener
+
+
+# ---------- ตาราง Markdown → รายการ (Discord แสดงตารางไม่ได้) ----------
+
+_TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$")
+
+
+def _cells(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _is_table_row(line: str) -> bool:
+    return line.strip().startswith("|") or line.count("|") >= 2
+
+
+def tables_to_lists(text: str) -> str:
+    """แปลงตาราง Markdown เป็นรายการ bullet (เว้นตารางที่อยู่ใน code block)
+
+    | ตัวเลือก | ค่า | คำอธิบาย |     →    - **Gyro X** — ค่า: 1.7 · คำอธิบาย: หมุนซ้าย-ขวา
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    in_code = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip().startswith("```"):
+            in_code = not in_code
+        if (
+            not in_code
+            and i + 1 < len(lines)
+            and "|" in line
+            and _TABLE_SEPARATOR.match(lines[i + 1])
+        ):
+            headers = _cells(line)
+            i += 2
+            while i < len(lines) and lines[i].strip() and _is_table_row(lines[i]):
+                row = _cells(lines[i])
+                first = row[0] if row else ""
+                if first and not first.startswith("**"):
+                    first = f"**{first}**"
+                rest = [
+                    f"{h}: {v}" if h else v
+                    for h, v in zip(headers[1:], row[1:], strict=False)
+                    if v
+                ]
+                out.append(f"- {first} — {' · '.join(rest)}" if rest else f"- {first}")
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
