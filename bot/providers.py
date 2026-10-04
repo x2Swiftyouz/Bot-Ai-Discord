@@ -209,6 +209,13 @@ class GeminiProvider(AIProvider):
     BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
     # โดน 429 ตอนค้นเว็บ → พักการค้นเว็บของโมเดลนั้นกี่วินาที
     SEARCH_PAUSE_SECONDS = 30 * 60
+    # ถ้าไม่บอก Gemini มักไม่ค้นเอง และตอบว่า "เข้าถึงข้อมูลเรียลไทม์ไม่ได้"
+    SEARCH_HINT = (
+        "คุณมีเครื่องมือ Google Search ใช้ค้นข้อมูลล่าสุดได้ "
+        "เมื่อถูกถามเรื่องข่าว เหตุการณ์ปัจจุบัน ราคา ผลกีฬา สภาพอากาศ เวอร์ชันล่าสุด "
+        "หรือข้อมูลที่อาจเปลี่ยนแปลงหลังจากข้อมูลที่คุณเรียนรู้มา ให้ค้นก่อนตอบเสมอ "
+        "ห้ามตอบว่าเข้าถึงข้อมูลเรียลไทม์ไม่ได้"
+    )
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
@@ -242,15 +249,23 @@ class GeminiProvider(AIProvider):
         parts.append({"text": prompt})
         contents.append({"role": "user", "parts": parts})
 
+        system_prompt = self.build_system_prompt()
         payload: dict = {
             "contents": contents,
             "generationConfig": {"temperature": self.temperature},
-            "systemInstruction": {"parts": [{"text": self.build_system_prompt()}]},
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
         }
         search = self._search_enabled(model)
         if search:
-            # ให้ Gemini ตัดสินใจเองว่าจะค้น Google ไหม (ค้นเฉพาะคำถามที่ต้องใช้ข้อมูลล่าสุด)
+            # Gemini ตัดสินใจเองว่าจะค้น Google ไหม (ค้นเฉพาะคำถามที่ต้องใช้ข้อมูลล่าสุด)
             payload["tools"] = [{"google_search": {}}]
+            payload["systemInstruction"] = {
+                "parts": [{"text": f"{system_prompt}\n\n{self.SEARCH_HINT}"}]
+            }
+
+        def without_search() -> None:
+            payload.pop("tools")
+            payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
 
         url = f"{self.BASE_URL}/{model}:generateContent"
         # ส่ง key ทาง header แทน query string เพื่อไม่ให้ key หลุดไปใน log ของ URL
@@ -262,7 +277,7 @@ class GeminiProvider(AIProvider):
                 raise
             log.warning("Gemini %s ใช้ค้นเว็บไม่ได้ จะตอบแบบไม่ค้นเว็บแทน", model)
             self._no_search_models.add(model)
-            payload.pop("tools")
+            without_search()
             data = await self._post_json(url, payload, headers, model)
         except RateLimitError:
             if not search:
@@ -272,7 +287,7 @@ class GeminiProvider(AIProvider):
             minutes = self.SEARCH_PAUSE_SECONDS // 60
             log.warning("Gemini %s โดน 429 ตอนค้นเว็บ พักการค้นเว็บ %s นาที", model, minutes)
             self._search_paused_until[model] = time.monotonic() + self.SEARCH_PAUSE_SECONDS
-            payload.pop("tools")
+            without_search()
             data = await self._post_json(url, payload, headers, model)
 
         if block := data.get("promptFeedback", {}).get("blockReason"):
@@ -291,6 +306,8 @@ class GeminiProvider(AIProvider):
             raise AIError(f"empty response (finishReason={candidate.get('finishReason')})")
 
         grounding = candidate.get("groundingMetadata") or {}
+        if search and grounding.get("webSearchQueries"):
+            log.info("Gemini ค้นเว็บ: %s", grounding["webSearchQueries"])
         sources: list[tuple[str, str]] = []
         for chunk in grounding.get("groundingChunks") or []:
             web = chunk.get("web") or {}
