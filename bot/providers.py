@@ -13,6 +13,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -217,9 +218,11 @@ class AIProvider(ABC):
         return sorted(available)[:10]
 
     async def check_models(self) -> list[str]:
-        """ตอนเริ่มบอท: เช็กว่าชื่อโมเดลใน .env ยังมีอยู่จริง (โมเดลฟรีถูกถอดบ่อย)
+        """เช็กว่าชื่อโมเดลใน .env ยังมีอยู่จริง (โมเดลฟรีถูกถอดบ่อย) — เรียกตอนเริ่มบอทและทุกวัน
 
-        เตือนใน log และคืนรายการปัญหาที่เจอ (ไว้ส่งเข้าห้อง log ของแอดมิน)
+        โมเดลที่ถูกถอดจะถูกตัดออกจากลำดับให้เอง ถ้าไม่เหลือโมเดลที่ใช้ได้เลย
+        จะเลือกโมเดลใหม่จากรายชื่อที่ใช้ได้ตอนนี้แทนให้อัตโนมัติ (ไม่ต้องแก้ .env)
+        คืนรายการสิ่งที่เปลี่ยน/ปัญหาที่เจอ (ไว้ส่งเข้าห้อง log ของแอดมิน)
         """
         try:
             available = await self.available_models()
@@ -233,15 +236,35 @@ class AIProvider(ABC):
         if not missing:
             log.info("ตรวจโมเดล %s: %s ใช้ได้ ✅", self.name, ", ".join(configured))
             return []
+
         prefix = self.name.upper()
         problems = []
+        kept = [m for m in self.models if m in available]
+        replacement = None
+        if not kept:
+            # ไม่เหลือโมเดลที่ใช้ได้ → เลือกตัวใหม่ (ถ้าเดิมใช้ตัวฟรีของ OpenRouter ก็เลือกเฉพาะตัวฟรี)
+            want_free = any(m.endswith(":free") for m in self.models)
+            choices = [m for m in self.suggest(available) if m.endswith(":free") or not want_free]
+            replacement = choices[0] if choices else None
+            if replacement:
+                kept = [replacement]
+        if kept:
+            self.models = kept
+            self.model = kept[0]
+        if self.vision_model in missing:
+            self.vision_model = None  # ใช้โมเดลปกติแทน (ถ้าอ่านรูปไม่ได้ จะไล่ไปเจ้าอื่นเอง)
+
         for model in missing:
+            if kept:
+                action = f"ใช้ {kept[0]!r} แทนให้อัตโนมัติแล้ว"
+            else:
+                action = "ไม่มีโมเดลอื่นให้สลับ (ไปใช้ AI สำรองเจ้าอื่นแทน)"
             message = (
-                f"⚠️ {self.name} ไม่มีโมเดล {model!r} แล้ว (ถูกถอดหรือพิมพ์ผิด) — แก้ "
-                f"{prefix}_MODEL / {prefix}_FALLBACK_MODELS / {prefix}_VISION_MODEL ใน .env | "
-                f"ตัวอย่างโมเดลที่ใช้ได้ตอนนี้: {', '.join(self.suggest(available))}"
+                f"⚠️ {self.name} ไม่มีโมเดล {model!r} แล้ว (ถูกถอดหรือพิมพ์ผิด) → {action} | "
+                f"ถ้าอยากเลือกเอง แก้ {prefix}_MODEL / {prefix}_FALLBACK_MODELS / {prefix}_VISION_MODEL | "
+                f"ตัวอย่างโมเดลที่ใช้ได้ตอนนี้: {', '.join(self.suggest(available)[:8])}"
             )
-            log.error("%s", message)
+            log.warning("%s", message)
             problems.append(message)
         return problems
 
@@ -410,8 +433,11 @@ class GeminiProvider(AIProvider):
     @staticmethod
     def suggest(available: set[str]) -> list[str]:
         # รุ่นใหม่ก่อน เฉพาะตระกูล flash / pro
-        names = [m for m in available if "flash" in m or "pro" in m]
-        return sorted(names, reverse=True)[:10]
+        skip = ("image", "tts", "audio", "live", "embedding", "lite", "thinking", "exp")
+        names = [m for m in available if ("flash" in m or "pro" in m) and not any(k in m for k in skip)]
+        # flash ก่อน (โควต้าฟรีเยอะกว่า pro) → รุ่นใหม่ก่อน
+        names.sort(reverse=True)
+        return sorted(names, key=lambda m: ("flash" not in m, "preview" in m))
 
     def _search_enabled(self, model: str) -> bool:
         if not self.web_search or model in self._no_search_models:
@@ -558,13 +584,24 @@ class OpenAICompatibleProvider(AIProvider):
         data = await self._get_json(url, headers)
         return {m["id"] for m in data.get("data") or [] if m.get("id")}
 
-    @staticmethod
-    def suggest(available: set[str]) -> list[str]:
+    # ตระกูลโมเดลที่ตอบแชต/ภาษาไทยได้ดี เรียงตามที่อยากใช้ก่อน (ไว้เลือกตัวแทนอัตโนมัติ)
+    PREFERRED_FAMILIES = ("gpt-oss", "llama-3.3", "gemma", "qwen", "deepseek", "llama", "mistral", "nemotron")
+
+    @classmethod
+    def suggest(cls, available: set[str]) -> list[str]:
         # ตัดโมเดลเสียง/ตัวกรองออก (ใช้ตอบแชตไม่ได้) และ OpenRouter แสดงเฉพาะตัวฟรี
-        skip = ("whisper", "tts", "guard", "embed", "playai", "orpheus")
-        names = [m for m in available if not any(k in m for k in skip)]
+        skip = ("whisper", "tts", "guard", "embed", "playai", "orpheus", "audio", "image", "router")
+        names = [m for m in available if not any(k in m.lower() for k in skip)]
         free = [m for m in names if m.endswith(":free")]
-        return sorted(free or names)[:10]
+
+        def rank(model: str) -> tuple:
+            lower = model.lower()
+            family = next((i for i, f in enumerate(cls.PREFERRED_FAMILIES) if f in lower), 99)
+            sizes = [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)b(?![a-z])", lower)]
+            # ตระกูลที่ชอบก่อน → ตัวใหญ่ก่อน (ฉลาดกว่า) → ชื่อ
+            return (family, -max(sizes, default=0), model)
+
+        return sorted(free or names, key=rank)
 
     async def _generate(
         self,
@@ -798,6 +835,10 @@ class BackupProvider:
         assert first_error is not None
         # แจ้งผู้ใช้ด้วย error ของเจ้าแรกที่ลอง (สาเหตุแรก)
         raise first_error
+
+    @property
+    def providers(self) -> list[AIProvider]:
+        return [self.primary, *self.backups]
 
     async def check_models(self) -> list[str]:
         problems = await self.primary.check_models()

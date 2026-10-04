@@ -171,15 +171,19 @@ class AIChatBot(discord.Client):
             self._cleaned_commands = True
             await self._remove_stale_commands()
             problems = await self.ai.check_models()
+            primary, *backup_list = getattr(self.ai, "providers", [self.ai])
             search = "Tavily" if self.config.tavily_api_key else "ปิด"
-            backups = "\n".join(f"`{b.provider}/{b.model}`" for b in self.config.backups) or "ไม่มี"
+            backups = "\n".join(f"`{b.name}/{b.model}`" for b in backup_list) or "ไม่มี"
             self.admin_log.status(
                 "info", "🤖 บอทออนไลน์แล้ว",
-                f"**AI หลัก:** `{self.config.provider}/{self.config.model}`\n"
+                f"**AI หลัก:** `{primary.name}/{primary.model}`\n"
                 f"**สำรอง:**\n{backups}\n**ค้นเว็บ:** {search}",
             )
-            for problem in problems:
-                self.admin_log.status("warning", "⚠️ พบโมเดลที่ใช้ไม่ได้ใน .env", problem.removeprefix("⚠️ "))
+            self._report_model_problems(problems)
+
+    def _report_model_problems(self, problems: list[str]) -> None:
+        for problem in problems:
+            self.admin_log.status("warning", "⚠️ โมเดลใน .env ถูกถอด — สลับให้แล้ว", problem.removeprefix("⚠️ "))
 
     @tasks.loop(hours=24)
     async def daily_summary(self) -> None:
@@ -190,6 +194,8 @@ class AIChatBot(discord.Client):
         channel = self.get_channel(self.admin_log.channel_id or 0)
         guild_id = getattr(getattr(channel, "guild", None), "id", None)
         self.admin_log.post(embed=self._stats_embed(guild_id, day=yesterday))
+        # โมเดลฟรีถูกถอดได้ทุกเมื่อ → เช็กซ้ำทุกวัน แล้วสลับไปตัวที่ยังใช้ได้ให้เอง
+        self._report_model_problems(await self.ai.check_models())
 
     @daily_summary.before_loop
     async def _before_daily_summary(self) -> None:
