@@ -14,7 +14,8 @@ import base64
 import logging
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+import json
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 
 import aiohttp
@@ -35,6 +36,10 @@ class ImageData:
 
     def b64(self) -> str:
         return base64.b64encode(self.data).decode("ascii")
+
+
+# รับ "ข้อความทั้งหมดที่ได้มาถึงตอนนี้" ระหว่าง streaming (ใช้แสดงคำตอบค่อย ๆ พิมพ์)
+OnDelta = Callable[[str], None]
 
 
 @dataclass(frozen=True)
@@ -109,6 +114,7 @@ class AIProvider(ABC):
         self.temperature = config.temperature
         # มี Tavily แล้วไม่ต้องใช้ค้นเว็บของ Gemini (ซึ่ง free tier มักไม่มีโควต้า)
         self.web_search = config.web_search and not config.tavily_api_key
+        self.streaming = config.streaming
         self._timeout = aiohttp.ClientTimeout(total=config.ai_timeout)
         self._session: aiohttp.ClientSession | None = None
         # (ลำดับ key, โมเดล) ที่เกินโควต้า -> เวลาที่จะลองใช้ได้อีก
@@ -130,39 +136,77 @@ class AIProvider(ABC):
         session = await self._get_session()
         try:
             async with session.post(url, json=payload, headers=headers) as resp:
-                if resp.status == 429:
-                    # ข้อความใน body บอกว่าโควต้าตัวไหนหมด (ต่อนาที / ต่อวัน / ค้นเว็บ)
-                    body = await resp.text()
-                    log.warning("%s HTTP 429 (model %s): %s", self.name, model, body[:800])
-                    raise RateLimitError(_parse_retry_after(resp.headers), body)
-                if resp.status in (401, 403):
-                    log.error("%s auth error %s: %s", self.name, resp.status, await resp.text())
-                    raise AuthError(f"HTTP {resp.status}")
-                if resp.status == 404:
-                    log.error(
-                        "%s HTTP 404 — model %r not found, update *_MODEL in .env: %s",
-                        self.name, model, (await resp.text())[:500],
-                    )
-                    raise ModelNotFoundError("HTTP 404")
-                if resp.status in (500, 502, 503, 504):
-                    log.warning(
-                        "%s HTTP %s (model %s): %s",
-                        self.name, resp.status, model, (await resp.text())[:300],
-                    )
-                    raise ServiceUnavailableError(f"HTTP {resp.status}")
-                if resp.status == 400:
-                    log.error("%s HTTP 400 (model %s): %s", self.name, model, (await resp.text())[:500])
-                    raise BadRequestError("HTTP 400")
-                if resp.status >= 400:
-                    body = await resp.text()
-                    log.error("%s HTTP %s: %s", self.name, resp.status, body[:500])
-                    raise AIError(f"HTTP {resp.status}")
-                return await resp.json(content_type=None)
+                await self._raise_for_status(resp, model)
+                try:
+                    return await resp.json(content_type=None)
+                except ValueError as e:
+                    raise AIError("invalid JSON response") from e
         except TimeoutError as e:  # aiohttp ใช้ asyncio.TimeoutError (= TimeoutError ใน 3.11+)
             raise AITimeoutError("timeout") from e
         except aiohttp.ClientError as e:
             log.error("%s connection error: %r", self.name, e)
             raise AIError("connection error") from e
+
+    async def _post_stream(
+        self, url: str, payload: dict, headers: dict, model: str
+    ) -> AsyncIterator[dict]:
+        """ส่ง POST แบบ streaming (Server-Sent Events) แล้วคืน JSON ทีละก้อนที่ได้รับ"""
+        session = await self._get_session()
+        # streaming ใช้เวลารวมนานได้ จึงจำกัดแค่ "เงียบนานเกิน" แทนเวลารวม
+        timeout = aiohttp.ClientTimeout(total=None, sock_read=self._timeout.total)
+        try:
+            async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+                await self._raise_for_status(resp, model)
+                buffer = b""
+                async for chunk in resp.content.iter_any():
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        line = line.strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == b"[DONE]":
+                            return
+                        try:
+                            yield json.loads(data)
+                        except ValueError:
+                            log.debug("%s: skip bad SSE line %r", self.name, data[:200])
+        except TimeoutError as e:
+            raise AITimeoutError("timeout") from e
+        except aiohttp.ClientError as e:
+            log.error("%s connection error: %r", self.name, e)
+            raise AIError("connection error") from e
+
+    async def _raise_for_status(self, resp: aiohttp.ClientResponse, model: str) -> None:
+        """แปลง HTTP error เป็น exception ที่บอทเข้าใจ (ไม่ทำอะไรถ้าสำเร็จ)"""
+        if resp.status == 429:
+            # ข้อความใน body บอกว่าโควต้าตัวไหนหมด (ต่อนาที / ต่อวัน / ค้นเว็บ)
+            body = await resp.text()
+            log.warning("%s HTTP 429 (model %s): %s", self.name, model, body[:800])
+            raise RateLimitError(_parse_retry_after(resp.headers), body)
+        if resp.status in (401, 403):
+            log.error("%s auth error %s: %s", self.name, resp.status, await resp.text())
+            raise AuthError(f"HTTP {resp.status}")
+        if resp.status == 404:
+            log.error(
+                "%s HTTP 404 — model %r not found, update *_MODEL in .env: %s",
+                self.name, model, (await resp.text())[:500],
+            )
+            raise ModelNotFoundError("HTTP 404")
+        if resp.status in (500, 502, 503, 504):
+            log.warning(
+                "%s HTTP %s (model %s): %s",
+                self.name, resp.status, model, (await resp.text())[:300],
+            )
+            raise ServiceUnavailableError(f"HTTP {resp.status}")
+        if resp.status == 400:
+            log.error("%s HTTP 400 (model %s): %s", self.name, model, (await resp.text())[:500])
+            raise BadRequestError("HTTP 400")
+        if resp.status >= 400:
+            body = await resp.text()
+            log.error("%s HTTP %s: %s", self.name, resp.status, body[:500])
+            raise AIError(f"HTTP {resp.status}")
 
     def build_system_prompt(self) -> str:
         """system prompt + วันเวลาปัจจุบัน (AI ไม่รู้วันที่เองจึงคำนวณระยะเวลาผิดถ้าไม่บอก)"""
@@ -170,9 +214,17 @@ class AIProvider(ABC):
         return f"{self.system_prompt}\n\n{now}" if self.system_prompt else now
 
     async def generate(
-        self, history: list[ChatMessage], prompt: str, images: Sequence[ImageData] = ()
+        self,
+        history: list[ChatMessage],
+        prompt: str,
+        images: Sequence[ImageData] = (),
+        on_delta: OnDelta | None = None,
+        retry: bool = True,
     ) -> AIResult:
         """รับประวัติบทสนทนา + คำถามใหม่ (+ รูปถ้ามี) คืนข้อความคำตอบ
+
+        on_delta: ถ้าส่งมา (และเปิด STREAMING) จะถูกเรียกด้วยข้อความที่ได้มาเรื่อย ๆ ระหว่างรอ
+        retry=False: ไม่ลองซ้ำเมื่อเซิร์ฟเวอร์ล่ม (ใช้เมื่อมีตัวสำรองที่ตอบแทนได้ทันที)
 
         - เซิร์ฟเวอร์ล่มชั่วคราว (5xx): ลองซ้ำกับโมเดลเดิม โดยรอนานขึ้นเรื่อย ๆ (1, 2, 4 ... วินาที)
         - ล่มต่อเนื่อง / เกินโควต้า (429) / ไม่พบโมเดล (404): ข้ามไปโมเดลสำรองถัดไป
@@ -190,7 +242,9 @@ class AIProvider(ABC):
                 last_error = last_error or RateLimitError()
             for no, key in keys:
                 try:
-                    return await self._generate_with_retry(model, no, key, history, prompt, images)
+                    return await self._generate_with_retry(
+                        model, key, history, prompt, images, on_delta, retry
+                    )
                 except RateLimitError as e:
                     # key นี้เกินโควต้า → พักไว้ แล้วลอง key ถัดไป (key จากคนละโปรเจกต์ได้โควต้าแยกกัน)
                     last_error = e
@@ -215,18 +269,21 @@ class AIProvider(ABC):
     async def _generate_with_retry(
         self,
         model: str,
-        key_no: int,
         key: str,
         history: list[ChatMessage],
         prompt: str,
         images: Sequence[ImageData],
+        on_delta: OnDelta | None,
+        retry: bool,
     ) -> AIResult:
         """เรียก API ด้วยโมเดล + key ที่กำหนด ถ้าเซิร์ฟเวอร์ล่ม (5xx) ลองซ้ำโดยรอ 1, 2, 4 ... วินาที"""
-        for attempt in range(self.max_retries + 1):
+        max_retries = self.max_retries if retry else 0
+        stream = on_delta if self.streaming else None
+        for attempt in range(max_retries + 1):
             try:
-                return await self._generate(model, key, history, prompt, images)
+                return await self._generate(model, key, history, prompt, images, stream)
             except ServiceUnavailableError:
-                if attempt >= self.max_retries:
+                if attempt >= max_retries:
                     raise
                 delay = 2**attempt
                 log.info("%s %s busy, retrying in %ss", self.name, model, delay)
@@ -241,8 +298,9 @@ class AIProvider(ABC):
         history: list[ChatMessage],
         prompt: str,
         images: Sequence[ImageData],
+        on_delta: OnDelta | None,
     ) -> AIResult:
-        """เรียก API หนึ่งครั้งด้วยโมเดลที่กำหนด คืนข้อความคำตอบ"""
+        """เรียก API หนึ่งครั้งด้วยโมเดลที่กำหนด คืนข้อความคำตอบ (stream ถ้ามี on_delta)"""
 
 
 class GeminiProvider(AIProvider):
@@ -279,6 +337,7 @@ class GeminiProvider(AIProvider):
         history: list[ChatMessage],
         prompt: str,
         images: Sequence[ImageData],
+        on_delta: OnDelta | None,
     ) -> AIResult:
         contents = [
             {
@@ -311,18 +370,25 @@ class GeminiProvider(AIProvider):
             payload.pop("tools")
             payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
 
-        url = f"{self.BASE_URL}/{model}:generateContent"
         # ส่ง key ทาง header แทน query string เพื่อไม่ให้ key หลุดไปใน log ของ URL
         headers = {"x-goog-api-key": api_key}
+
+        async def request() -> dict:
+            if on_delta is None:
+                url = f"{self.BASE_URL}/{model}:generateContent"
+                return await self._post_json(url, payload, headers, model)
+            url = f"{self.BASE_URL}/{model}:streamGenerateContent?alt=sse"
+            return await self._collect_stream(url, payload, headers, model, on_delta)
+
         try:
-            data = await self._post_json(url, payload, headers, model)
+            data = await request()
         except BadRequestError:
             if not search:
                 raise
             log.warning("Gemini %s ใช้ค้นเว็บไม่ได้ จะตอบแบบไม่ค้นเว็บแทน", model)
             self._no_search_models.add(model)
             without_search()
-            data = await self._post_json(url, payload, headers, model)
+            data = await request()
         except RateLimitError:
             if not search:
                 raise
@@ -332,7 +398,7 @@ class GeminiProvider(AIProvider):
             log.warning("Gemini %s โดน 429 ตอนค้นเว็บ พักการค้นเว็บ %s นาที", model, minutes)
             self._search_paused_until[model] = time.monotonic() + self.SEARCH_PAUSE_SECONDS
             without_search()
-            data = await self._post_json(url, payload, headers, model)
+            data = await request()
             hours = self.SEARCH_QUOTA_PAUSE_SECONDS // 3600
             log.warning(
                 "Gemini %s ตอบได้เมื่อไม่ค้นเว็บ → โควต้าค้นเว็บหมด (หรือ free tier ไม่มีให้) "
@@ -368,6 +434,27 @@ class GeminiProvider(AIProvider):
             text, model, tuple(sources), searched=bool(grounding.get("webSearchQueries"))
         )
 
+    async def _collect_stream(
+        self, url: str, payload: dict, headers: dict, model: str, on_delta: OnDelta
+    ) -> dict:
+        """รับคำตอบแบบ stream แล้วรวมเป็นรูปแบบเดียวกับ generateContent ปกติ"""
+        text = ""
+        candidate: dict = {}
+        prompt_feedback: dict = {}
+        async for chunk in self._post_stream(url, payload, headers, model):
+            prompt_feedback = chunk.get("promptFeedback") or prompt_feedback
+            for cand in (chunk.get("candidates") or [])[:1]:
+                for part in (cand.get("content") or {}).get("parts") or []:
+                    if part.get("text") and not part.get("thought"):
+                        text += part["text"]
+                        on_delta(text)
+                if cand.get("finishReason"):
+                    candidate["finishReason"] = cand["finishReason"]
+                if cand.get("groundingMetadata"):
+                    candidate["groundingMetadata"] = cand["groundingMetadata"]
+        candidate["content"] = {"parts": [{"text": text}]}
+        return {"candidates": [candidate], "promptFeedback": prompt_feedback}
+
 
 class OpenAICompatibleProvider(AIProvider):
     """ใช้ได้กับทุก API ที่รองรับรูปแบบ OpenAI Chat Completions (Groq, OpenRouter ฯลฯ)"""
@@ -384,6 +471,7 @@ class OpenAICompatibleProvider(AIProvider):
         history: list[ChatMessage],
         prompt: str,
         images: Sequence[ImageData],
+        on_delta: OnDelta | None,
     ) -> AIResult:
         messages: list[dict] = []
         messages.append({"role": "system", "content": self.build_system_prompt()})
@@ -401,12 +489,22 @@ class OpenAICompatibleProvider(AIProvider):
             content = prompt
         messages.append({"role": "user", "content": content})
 
-        data = await self._post_json(
-            self.url,
-            {"model": model, "messages": messages, "temperature": self.temperature},
-            {"Authorization": f"Bearer {api_key}", **self.extra_headers()},
-            model,
-        )
+        payload = {"model": model, "messages": messages, "temperature": self.temperature}
+        headers = {"Authorization": f"Bearer {api_key}", **self.extra_headers()}
+        if on_delta is None:
+            data = await self._post_json(self.url, payload, headers, model)
+        else:
+            text = ""
+            async for chunk in self._post_stream(self.url, {**payload, "stream": True}, headers, model):
+                if chunk.get("error"):
+                    data = chunk
+                    break
+                for choice in (chunk.get("choices") or [])[:1]:
+                    if piece := (choice.get("delta") or {}).get("content"):
+                        text += piece
+                        on_delta(text)
+            else:
+                data = {"choices": [{"message": {"content": text}}]}
 
         # OpenRouter บางครั้งตอบ HTTP 200 แต่มี error อยู่ใน body
         if err := data.get("error"):
@@ -455,12 +553,21 @@ class BackupProvider:
         self._primary_paused_until = 0.0
 
     async def generate(
-        self, history: list[ChatMessage], prompt: str, images: Sequence[ImageData] = ()
+        self,
+        history: list[ChatMessage],
+        prompt: str,
+        images: Sequence[ImageData] = (),
+        on_delta: OnDelta | None = None,
+        retry: bool = True,
     ) -> AIResult:
         primary_error: AIError | None = None
         if time.monotonic() >= self._primary_paused_until:
             try:
-                return await self.primary.generate(history, prompt, images)
+                # สลับแบบฉลาด: ข้อความธรรมดา → ตัวหลักล่มแล้วไปตัวสำรองทันที (ไม่ต้องรอลองซ้ำ)
+                # มีรูป → ลองตัวหลักซ้ำก่อน เพราะตัวสำรองอาจอ่านรูปไม่ได้
+                return await self.primary.generate(
+                    history, prompt, images, on_delta, retry=retry and bool(images)
+                )
             except self.NO_BACKUP_ERRORS:
                 raise
             except AIError as e:
@@ -473,7 +580,7 @@ class BackupProvider:
                 else:
                     log.warning("%s ใช้ไม่ได้ (%r) ใช้ %s แทน", self.primary.name, e, self.backup.name)
         try:
-            result = await self.backup.generate(history, prompt, images)
+            result = await self.backup.generate(history, prompt, images, on_delta, retry)
         except AIError as e:
             log.warning("ตัวสำรอง %s ก็ใช้ไม่ได้: %r", self.backup.name, e)
             # แจ้งผู้ใช้ด้วย error ของตัวหลัก (สาเหตุแรก) ถ้ามี

@@ -119,6 +119,7 @@ class Config:
     memory_persist: bool
     daily_limit: int
     show_footer: bool
+    streaming: bool
     memory_size: int
     max_images: int
     max_image_bytes: int
@@ -201,6 +202,7 @@ class Config:
             memory_persist=_get_bool("MEMORY_PERSIST", True),
             daily_limit=max(0, _get_int("DAILY_LIMIT_PER_USER", 30)),
             show_footer=_get_bool("SHOW_FOOTER", True),
+            streaming=_get_bool("STREAMING", True),
             memory_size=max(1, _get_int("MEMORY_SIZE", 10)),
             max_images=max(0, _get_int("MAX_IMAGES", 4)),
             max_image_bytes=int(max(0.1, _get_float("MAX_IMAGE_MB", 5)) * 1024 * 1024),
