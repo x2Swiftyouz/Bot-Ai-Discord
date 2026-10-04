@@ -22,6 +22,15 @@ log = logging.getLogger(__name__)
 
 SETTING_KEY = "log_channel_id"
 
+STATUS_COLORS = {
+    "down": discord.Color.orange(),
+    "outage": discord.Color.red(),
+    "up": discord.Color.green(),
+    "recovered": discord.Color.green(),
+    "info": discord.Color.blurple(),
+    "warning": discord.Color.gold(),
+}
+
 
 class AdminLog:
     COOLDOWN = 600
@@ -41,6 +50,15 @@ class AdminLog:
 
     def set_channel(self, channel_id: int | None) -> None:
         self.bot.db.set_setting(SETTING_KEY, str(channel_id) if channel_id else "off")
+
+    def status(self, kind: str, title: str, detail: str = "") -> None:
+        """การ์ดสีแจ้งสถานะ (ส้ม = ใช้ไม่ได้, แดง = ใช้ไม่ได้ทุกตัว, เขียว = กลับมาแล้ว)"""
+        embed = discord.Embed(
+            title=title, description=detail or None,
+            color=STATUS_COLORS.get(kind, discord.Color.blurple()),
+            timestamp=discord.utils.utcnow(),
+        )
+        self.post(embed=embed)
 
     def post(
         self,

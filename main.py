@@ -130,7 +130,7 @@ class AIChatBot(discord.Client):
         self.ai: AIProvider | BackupProvider = create_provider(config)
         if isinstance(self.ai, BackupProvider):
             # แจ้งเข้าห้อง log เมื่อสลับไปตัวสำรอง / AI ใช้ไม่ได้ทุกตัว
-            self.ai.on_event = lambda key, message: self.admin_log.post(message, key=key)
+            self.ai.on_event = self.admin_log.status
         self.answer_count = 0
         self._cleaned_commands = False
         self._background: set[asyncio.Task] = set()
@@ -165,12 +165,14 @@ class AIChatBot(discord.Client):
             await self._remove_stale_commands()
             problems = await self.ai.check_models()
             search = "Tavily" if self.config.tavily_api_key else "ปิด"
-            self.admin_log.post(
-                f"✅ **บอทออนไลน์แล้ว** · AI: `{self.config.provider}/{self.config.model}` · "
-                f"สำรอง: `{self.config.backup_summary}` · ค้นเว็บ: {search}"
+            backups = "\n".join(f"`{b.provider}/{b.model}`" for b in self.config.backups) or "ไม่มี"
+            self.admin_log.status(
+                "info", "🤖 บอทออนไลน์แล้ว",
+                f"**AI หลัก:** `{self.config.provider}/{self.config.model}`\n"
+                f"**สำรอง:**\n{backups}\n**ค้นเว็บ:** {search}",
             )
             for problem in problems:
-                self.admin_log.post(problem)
+                self.admin_log.status("warning", "⚠️ พบโมเดลที่ใช้ไม่ได้ใน .env", problem.removeprefix("⚠️ "))
 
     @tasks.loop(hours=24)
     async def daily_summary(self) -> None:
