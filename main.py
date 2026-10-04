@@ -39,6 +39,7 @@ from bot.utils import (
     DISCORD_LIMIT, now_text, redact, split_message, suppress_link_previews, tables_to_lists,
 )
 from bot.views import AnswerContext, AnswerView, CloseThreadView
+from bot.voice import Transcriber, TranscriptionError, is_audio
 
 logging.basicConfig(
     level=logging.INFO,
@@ -126,6 +127,9 @@ class AIChatBot(discord.Client):
         self.memory = ChannelMemory(config.memory_size, self.db if config.memory_persist else None)
         self.search = TavilySearch(config.tavily_api_key) if config.tavily_api_key else None
         self.admin_log = AdminLog(self, config.log_channel_id)
+        self.transcriber = (
+            Transcriber(config.voice_api_keys, config.voice_model) if config.voice_api_keys else None
+        )
         self.cooldown = UserCooldown(config.user_cooldown)
         self.ai_channels = AIChannelStore(
             config.ai_channel_ids, config.data_dir / "ai_channels.json"
@@ -245,6 +249,8 @@ class AIChatBot(discord.Client):
         await self.ai.close()
         if self.search:
             await self.search.close()
+        if self.transcriber:
+            await self.transcriber.close()
         await super().close()
         self.db.close()
 
@@ -684,7 +690,8 @@ class AIChatBot(discord.Client):
         attachments = [*message.attachments, *quoted_attachments]
         has_image = self.config.max_images > 0 and any(map(is_image, attachments))
         has_file = self.config.max_file_chars > 0 and any(map(is_document, attachments))
-        if not question and not has_image and not has_file and not quote:
+        audio = [a for a in message.attachments if is_audio(a)] if self.transcriber else []
+        if not question and not has_image and not has_file and not quote and not audio:
             # ในห้องคุยกับ AI ข้อความที่มีแต่สติกเกอร์/ไฟล์อื่น ให้ข้ามไปเงียบ ๆ
             if not in_ai_channel:
                 await message.reply("สวัสดี! พิมพ์คำถามต่อจากการ mention ได้เลย หรือใช้ `/ask` ก็ได้ 😊")
@@ -693,6 +700,14 @@ class AIChatBot(discord.Client):
         if wait_msg := self._limit_message(message.author):
             await message.reply(wait_msg, delete_after=10)
             return
+
+        # ข้อความเสียง / ไฟล์เสียง → ถอดเป็นข้อความก่อน แล้วถาม AI ต่อตามปกติ
+        heard = ""
+        if audio:
+            heard = await self._transcribe(message, audio[0])
+            if heard is None:
+                return
+            question = f"{question}\n{heard}".strip()
 
         images: list[ImageData] = []
         file_text, file_names = "", ()
@@ -723,6 +738,9 @@ class AIChatBot(discord.Client):
             exempt=self._is_exempt(message.author), search_query=typed,
             attachments_text=file_text, file_names=file_names,
         )
+        if heard:
+            # ให้ผู้ใช้เห็นว่าบอทได้ยินว่าอะไร (เผื่อถอดเสียงผิด)
+            ctx.header = f"-# 🎤 ได้ยินว่า: “{heard[:300]}{'…' if len(heard) > 300 else ''}”\n"
         await self._react(message, REACT_THINKING)
         # โหมดเธรด: คำถามใหม่ในห้อง AI เปิดเธรดของตัวเอง แล้วตอบในเธรด (ความจำแยกตามเธรด)
         target: discord.abc.Messageable = message.channel
@@ -773,6 +791,32 @@ class AIChatBot(discord.Client):
             await thread.edit(name=f"💬 {title}")
         except discord.HTTPException as e:
             log.info("เปลี่ยนชื่อเธรดไม่ได้: %r", e)
+
+    async def _transcribe(self, message: discord.Message, attachment: discord.Attachment) -> str | None:
+        """ถอดเสียงไฟล์แนบ คืนข้อความ หรือ None ถ้าไม่สำเร็จ (แจ้งผู้ใช้แล้ว)"""
+        assert self.transcriber is not None
+        if attachment.size > self.config.max_audio_bytes:
+            await message.reply(
+                f"🎤 ไฟล์เสียงใหญ่เกิน {self.config.max_audio_bytes // (1024 * 1024)} MB ถอดเสียงไม่ได้นะ",
+                allowed_mentions=REPLY_MENTIONS,
+            )
+            return None
+        await self._react(message, "🎤")
+        try:
+            async with message.channel.typing():
+                data = await attachment.read()
+                text = await self.transcriber.transcribe(data, attachment.filename, attachment.content_type)
+        except (TranscriptionError, discord.HTTPException) as e:
+            log.warning("ถอดเสียงไม่สำเร็จ: %r", e)
+            self.admin_log.post(f"🎤 ถอดเสียงไม่สำเร็จ: `{e}`"[:400], key="transcribe")
+            await message.reply("🎤 ถอดเสียงไม่สำเร็จ ลองส่งใหม่หรือพิมพ์แทนนะ", allowed_mentions=REPLY_MENTIONS)
+            return None
+        finally:
+            await self._unreact(message, "🎤")
+        if not text:
+            await message.reply("🎤 ไม่ได้ยินเสียงพูดในข้อความนี้เลย ลองอัดใหม่อีกครั้งนะ", allowed_mentions=REPLY_MENTIONS)
+            return None
+        return text
 
     def _thread_mode(self, channel: discord.abc.Messageable) -> bool:
         if isinstance(channel, discord.Thread) or not isinstance(channel, discord.TextChannel):

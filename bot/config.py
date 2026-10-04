@@ -141,6 +141,10 @@ class Config:
     max_file_chars: int
     long_answer_file_chars: int
     thread_auto_title: bool
+    # ถอดเสียง (Groq Whisper): ใช้ GROQ_API_KEY(S) — ว่าง = ปิด
+    voice_api_keys: tuple[str, ...]
+    voice_model: str
+    max_audio_bytes: int
     user_cooldown: float
     ai_timeout: float
     temperature: float
@@ -231,6 +235,13 @@ class Config:
             max_file_chars=max(0, _get_int("MAX_FILE_CHARS", 40000)),
             long_answer_file_chars=max(0, _get_int("LONG_ANSWER_FILE_CHARS", 4000)),
             thread_auto_title=_get_bool("THREAD_AUTO_TITLE", True),
+            voice_api_keys=tuple(dict.fromkeys(
+                k for k in _split(os.getenv("GROQ_API_KEY", "")) + _split(os.getenv("GROQ_API_KEYS", ""))
+                + [x for x in _split(os.getenv("GROQ_FALLBACK_MODELS", "")) if looks_like_secret(x)]
+            )) if _get_bool("VOICE_TRANSCRIPTION", True) else (),
+            voice_model=os.getenv("VOICE_MODEL", "").strip() or "whisper-large-v3-turbo",
+            # Groq รับไฟล์เสียงฟรีไม่เกิน 25 MB
+            max_audio_bytes=int(min(25, max(0.1, _get_float("MAX_AUDIO_MB", 25))) * 1024 * 1024),
             user_cooldown=max(0.0, _get_float("USER_COOLDOWN_SECONDS", 10)),
             ai_timeout=max(5.0, _get_float("AI_TIMEOUT_SECONDS", 60)),
             temperature=_get_float("AI_TEMPERATURE", 0.7),

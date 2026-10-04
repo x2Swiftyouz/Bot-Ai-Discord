@@ -12,6 +12,7 @@
 | ปุ่มใต้คำตอบ | 🔄 ตอบใหม่ · ➡️ เขียนต่อ · 🗑️ ลบ · 📝 สั้นลง · 📖 ละเอียดขึ้น · 🌐 แปลอังกฤษ/ไทย (คนถามหรือคนที่มีสิทธิ์ Manage Messages กดได้ ใช้ได้ 10 นาที) |
 | โหมดเธรด | `/aichannel เปิดแบบเธรด` → คำถามใหม่ในห้อง AI เปิดเธรดของตัวเอง คุยต่อในเธรด ห้องไม่รก · AI ตั้งชื่อเธรดให้ตรงเรื่อง · ปุ่ม 🔒 ปิดเธรด (ต้องมีสิทธิ์ Create Public Threads) |
 | อ่านไฟล์ | แนบ **PDF / .txt / ไฟล์โค้ด** (.py .js .json .md .csv ฯลฯ) แล้วให้สรุปหรือหาบั๊ก · ใช้ได้ทั้งในห้อง AI, `/ask file:` และเมนูคลิกขวา |
+| ข้อความเสียง | กดอัดเสียงแล้วส่งในห้อง AI (หรือแนบไฟล์เสียง mp3/m4a/ogg) → ถอดเสียงด้วย **Groq Whisper** (ฟรี ใช้ `GROQ_API_KEY` เดิม) แล้ว AI ตอบ พร้อมบอกว่า "🎤 ได้ยินว่า..." |
 | คำตอบยาวมาก | ยาวเกิน `LONG_ANSWER_FILE_CHARS` (4,000 ตัวอักษร) แสดงส่วนต้น + แนบฉบับเต็มเป็นไฟล์ `answer.txt` |
 | จำข้อมูลส่วนตัว | พิมพ์ `จำไว้ว่า ฉันชื่อ...` หรือ `/remember` → บอทจำได้ทุกห้อง แม้ `/reset` · `/memory` ดู · `/forget` ลบ (สูงสุด 10 ข้อต่อคน) |
 | คุยกันเองในห้อง AI | ขึ้นต้นข้อความด้วย `//` บอทจะไม่ตอบ |
@@ -61,12 +62,16 @@ Bot-Ai-Discord/
 │   ├── storage.py       # ฐานข้อมูล SQLite (ความจำ + สถิติ/โควต้า + ค่าตั้งค่า)
 │   ├── adminlog.py      # ห้อง log ของแอดมิน
 │   ├── persona.py       # บุคลิกต่อห้อง
+│   ├── voice.py         # ถอดเสียงด้วย Groq Whisper
 │   ├── config.py        # อ่านและตรวจสอบค่าจาก .env
 │   ├── providers.py     # เชื่อมต่อ Gemini / Groq / OpenRouter + จัดการ error
 │   ├── memory.py        # ความจำบทสนทนาแยกตามช่อง
 │   ├── cooldown.py      # cooldown ต่อผู้ใช้
 │   └── utils.py         # ตัดข้อความยาวเกิน 2000 ตัวอักษร
+├── tests/               # เทสต์อัตโนมัติ (pytest) — รันใน GitHub Actions ทุกครั้งที่ push / เปิด PR
+├── .github/workflows/   # GitHub Actions
 ├── requirements.txt
+├── requirements-dev.txt # pytest + ruff สำหรับนักพัฒนา
 ├── .env.example         # ตัวอย่างไฟล์ตั้งค่า (คัดลอกเป็น .env)
 ├── .gitignore           # กันไม่ให้ .env หลุดขึ้น Git
 └── README.md
@@ -236,6 +241,8 @@ python main.py
 | `MAX_FILE_MB` | `10` | ขนาดไฟล์เอกสารสูงสุดต่อไฟล์ (MB) |
 | `MAX_FILE_CHARS` | `40000` | ตัวอักษรสูงสุดจากไฟล์ที่ส่งให้ AI (`0` = ปิดการอ่านไฟล์) |
 | `LONG_ANSWER_FILE_CHARS` | `4000` | คำตอบยาวเกินนี้แนบเป็นไฟล์ .txt (`0` = ปิด) |
+| `VOICE_TRANSCRIPTION` | `true` | ถอดเสียงข้อความเสียงด้วย Groq Whisper (ต้องมี `GROQ_API_KEY`) |
+| `VOICE_MODEL` | `whisper-large-v3-turbo` | โมเดลถอดเสียงของ Groq |
 | `THREAD_AUTO_TITLE` | `true` | ให้ AI ตั้งชื่อเธรดหลังตอบคำถามแรก (ใช้คำขอ AI เพิ่ม 1 ครั้งต่อเธรด) |
 
 ## 🩺 แก้ปัญหาที่พบบ่อย
@@ -271,6 +278,16 @@ python main.py
 | log ขึ้น `PyNaCl is not installed, voice will NOT be supported` | เป็นแค่คำเตือนเรื่องระบบเสียง บอทนี้ไม่ใช้เสียง ไม่ต้องสนใจ |
 
 > หมายเหตุ: ความจำเก็บในหน่วยความจำ (RAM) — รีสตาร์ทบอทแล้วความจำจะหายหมด
+
+## 🧪 สำหรับนักพัฒนา: รันเทสต์
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+ruff check .      # ตรวจโค้ด
+pytest -q         # รันเทสต์ทั้งหมด (ไม่ต่ออินเทอร์เน็ต ไม่ใช้ key จริง ไม่อ่านไฟล์ .env)
+```
+
+GitHub Actions จะรันทั้งสองคำสั่งนี้ให้อัตโนมัติทุกครั้งที่ push เข้า `main` หรือเปิด Pull Request (ดูผลได้ที่แท็บ **Actions** ของ repo)
 
 ---
 

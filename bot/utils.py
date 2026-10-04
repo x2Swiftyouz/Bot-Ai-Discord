@@ -99,7 +99,7 @@ def _unclosed_fence(chunk: str) -> str | None:
 # ---------- ตาราง Markdown → รายการ (Discord แสดงตารางไม่ได้) ----------
 
 # <br> ของ HTML ที่ AI ชอบใส่ในตาราง — Discord แสดงเป็นตัวอักษรตรง ๆ
-_HTML_BREAK = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_HTML_BREAK = re.compile(r"[ \t]*<br\s*/?>[ \t]*", re.IGNORECASE)
 _TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$")
 
 
