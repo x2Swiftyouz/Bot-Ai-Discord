@@ -22,7 +22,7 @@ from bot.cooldown import UserCooldown
 from bot.media import is_image, read_images
 from bot.memory import ChannelMemory
 from bot.providers import AIError, AIProvider, BackupProvider, ImageData, create_provider
-from bot.utils import split_message
+from bot.utils import redact, split_message
 from bot.views import AnswerContext, AnswerView
 
 logging.basicConfig(
@@ -30,6 +30,21 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("bot")
+
+
+class _RedactSecrets(logging.Filter):
+    """ซ่อน API key / token ที่อาจหลุดมาในข้อความ log (เช่น ข้อความ error จาก API)"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        cleaned = redact(message)
+        if cleaned != message:
+            record.msg, record.args = cleaned, None
+        return True
+
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_RedactSecrets())
 
 # ห้ามคำตอบของ AI ไป ping @everyone / @here / role / ผู้ใช้คนอื่น
 SAFE_MENTIONS = discord.AllowedMentions.none()
@@ -604,6 +619,8 @@ def main() -> None:
     except ConfigError as e:
         log.error("ตั้งค่าไม่ถูกต้อง: %s (ดูตัวอย่างใน .env.example)", e)
         sys.exit(1)
+    for warning in config.warnings:
+        log.warning("การตั้งค่า: %s", warning)
 
     bot = AIChatBot(config)
     try:
