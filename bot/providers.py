@@ -15,7 +15,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import aiohttp
 
@@ -43,6 +43,7 @@ class AIResult:
     model: str  # โมเดลที่ตอบจริง (อาจเป็นโมเดลสำรอง)
     sources: tuple[tuple[str, str], ...] = ()  # (ชื่อเว็บ, ลิงก์) จากการค้นเว็บ
     searched: bool = False
+    backup: bool = False  # ตอบโดยผู้ให้บริการสำรอง
 
 
 class AIError(Exception):
@@ -369,6 +370,52 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         return {"X-Title": "Discord AI Bot"}
 
 
+class BackupProvider:
+    """ใช้ตัวหลักก่อน ถ้าเกินโควต้า/ล่ม/ช้า/error ค่อยใช้ตัวสำรอง
+
+    ถ้าตัวหลักโดน 429 จะพักตัวหลักไว้ชั่วครู่ แล้วส่งไปตัวสำรองตรง ๆ (ไม่ต้องรอตัวหลักตอบ error ทุกครั้ง)
+    """
+
+    # ไม่ใช้ตัวสำรองเมื่อคำถามถูกตัวกรองความปลอดภัยบล็อก
+    NO_BACKUP_ERRORS = (AIBlockedError,)
+    MIN_PAUSE_SECONDS = 60
+
+    def __init__(self, primary: AIProvider, backup: AIProvider) -> None:
+        self.primary = primary
+        self.backup = backup
+        self._primary_paused_until = 0.0
+
+    async def generate(
+        self, history: list[ChatMessage], prompt: str, images: Sequence[ImageData] = ()
+    ) -> AIResult:
+        primary_error: AIError | None = None
+        if time.monotonic() >= self._primary_paused_until:
+            try:
+                return await self.primary.generate(history, prompt, images)
+            except self.NO_BACKUP_ERRORS:
+                raise
+            except AIError as e:
+                primary_error = e
+                if isinstance(e, RateLimitError):
+                    pause = max(e.retry_after or 0, self.MIN_PAUSE_SECONDS)
+                    self._primary_paused_until = time.monotonic() + pause
+                    log.warning("พัก %s %.0f วินาที (เกินโควต้า) ใช้ %s แทน",
+                                self.primary.name, pause, self.backup.name)
+                else:
+                    log.warning("%s ใช้ไม่ได้ (%r) ใช้ %s แทน", self.primary.name, e, self.backup.name)
+        try:
+            result = await self.backup.generate(history, prompt, images)
+        except AIError as e:
+            log.warning("ตัวสำรอง %s ก็ใช้ไม่ได้: %r", self.backup.name, e)
+            # แจ้งผู้ใช้ด้วย error ของตัวหลัก (สาเหตุแรก) ถ้ามี
+            raise primary_error or e from e
+        return AIResult(result.text, result.model, result.sources, result.searched, backup=True)
+
+    async def close(self) -> None:
+        await self.primary.close()
+        await self.backup.close()
+
+
 _PROVIDERS: dict[str, type[AIProvider]] = {
     "gemini": GeminiProvider,
     "groq": GroqProvider,
@@ -376,5 +423,15 @@ _PROVIDERS: dict[str, type[AIProvider]] = {
 }
 
 
-def create_provider(config: Config) -> AIProvider:
-    return _PROVIDERS[config.provider](config)
+def create_provider(config: Config) -> AIProvider | BackupProvider:
+    primary = _PROVIDERS[config.provider](config)
+    if not config.backup_provider:
+        return primary
+    backup_config = replace(
+        config,
+        provider=config.backup_provider,
+        api_key=config.backup_api_key,
+        model=config.backup_model,
+        fallback_models=config.backup_fallback_models,
+    )
+    return BackupProvider(primary, _PROVIDERS[config.backup_provider](backup_config))

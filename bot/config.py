@@ -18,6 +18,23 @@ class ConfigError(Exception):
     pass
 
 
+def _provider_settings(provider: str, var: str) -> tuple[str, str, tuple[str, ...]]:
+    """อ่าน (API key, โมเดล, โมเดลสำรอง) ของผู้ให้บริการ AI จาก .env"""
+    if provider not in SUPPORTED_PROVIDERS:
+        raise ConfigError(f"{var}={provider!r} ไม่รองรับ ใช้ได้: {', '.join(SUPPORTED_PROVIDERS)}")
+    prefix = provider.upper()
+    api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
+    model = os.getenv(f"{prefix}_MODEL", "").strip()
+    if not api_key:
+        raise ConfigError(f"ไม่พบ {prefix}_API_KEY ใน .env (จำเป็นเพราะตั้ง {var}={provider})")
+    if not model:
+        raise ConfigError(f"ไม่พบ {prefix}_MODEL ใน .env (จำเป็นเพราะตั้ง {var}={provider})")
+    fallback_models = tuple(
+        m.strip() for m in os.getenv(f"{prefix}_FALLBACK_MODELS", "").split(",") if m.strip()
+    )
+    return api_key, model, fallback_models
+
+
 def _get_int(name: str, default: int) -> int:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -59,6 +76,11 @@ class Config:
     api_key: str
     model: str
     fallback_models: tuple[str, ...]
+    # ผู้ให้บริการสำรอง ใช้เมื่อตัวหลักเกินโควต้า/ล่ม (None = ไม่มี)
+    backup_provider: str | None
+    backup_api_key: str
+    backup_model: str
+    backup_fallback_models: tuple[str, ...]
     max_retries: int
     system_prompt: str
     timezone: str
@@ -78,22 +100,16 @@ class Config:
             raise ConfigError("ไม่พบ DISCORD_TOKEN ใน .env")
 
         provider = os.getenv("AI_PROVIDER", "gemini").strip().lower()
-        if provider not in SUPPORTED_PROVIDERS:
-            raise ConfigError(
-                f"AI_PROVIDER={provider!r} ไม่รองรับ ใช้ได้: {', '.join(SUPPORTED_PROVIDERS)}"
+        api_key, model, fallback_models = _provider_settings(provider, "AI_PROVIDER")
+
+        backup_provider = os.getenv("BACKUP_PROVIDER", "").strip().lower() or None
+        backup_api_key, backup_model, backup_fallback_models = "", "", ()
+        if backup_provider == provider:
+            raise ConfigError("BACKUP_PROVIDER ต้องไม่ซ้ำกับ AI_PROVIDER")
+        if backup_provider:
+            backup_api_key, backup_model, backup_fallback_models = _provider_settings(
+                backup_provider, "BACKUP_PROVIDER"
             )
-
-        prefix = provider.upper()
-        api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
-        model = os.getenv(f"{prefix}_MODEL", "").strip()
-        if not api_key:
-            raise ConfigError(f"ไม่พบ {prefix}_API_KEY ใน .env")
-        if not model:
-            raise ConfigError(f"ไม่พบ {prefix}_MODEL ใน .env")
-
-        fallback_models = tuple(
-            m.strip() for m in os.getenv(f"{prefix}_FALLBACK_MODELS", "").split(",") if m.strip()
-        )
 
         try:
             ai_channel_ids = tuple(
@@ -123,6 +139,10 @@ class Config:
             api_key=api_key,
             model=model,
             fallback_models=fallback_models,
+            backup_provider=backup_provider,
+            backup_api_key=backup_api_key,
+            backup_model=backup_model,
+            backup_fallback_models=backup_fallback_models,
             max_retries=min(5, max(0, _get_int("AI_MAX_RETRIES", 2))),
             system_prompt=os.getenv(
                 "SYSTEM_PROMPT", "You are a helpful assistant on Discord."

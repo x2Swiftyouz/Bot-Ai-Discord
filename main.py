@@ -21,7 +21,7 @@ from bot.config import Config, ConfigError
 from bot.cooldown import UserCooldown
 from bot.media import is_image, read_images
 from bot.memory import ChannelMemory
-from bot.providers import AIError, AIProvider, ImageData, create_provider
+from bot.providers import AIError, AIProvider, BackupProvider, ImageData, create_provider
 from bot.utils import split_message
 from bot.views import AnswerContext, AnswerView
 
@@ -65,7 +65,7 @@ class AIChatBot(discord.Client):
         self.ai_channels = AIChannelStore(
             config.ai_channel_ids, config.data_dir / "ai_channels.json"
         )
-        self.ai: AIProvider = create_provider(config)
+        self.ai: AIProvider | BackupProvider = create_provider(config)
         self.answer_count = 0
         self._statuses = itertools.cycle(self._status_texts())
         self._register_commands()
@@ -85,8 +85,10 @@ class AIChatBot(discord.Client):
 
     async def on_ready(self) -> None:
         log.info(
-            "Logged in as %s (ID %s) | provider=%s model=%s",
+            "Logged in as %s (ID %s) | provider=%s model=%s backup=%s",
             self.user, self.user.id if self.user else "?", self.config.provider, self.config.model,
+            f"{self.config.backup_provider}/{self.config.backup_model}"
+            if self.config.backup_provider else "-",
         )
 
     def _status_texts(self) -> list[Callable[[], str]]:
@@ -146,6 +148,8 @@ class AIChatBot(discord.Client):
         if not self.config.show_footer:
             return ""
         info = f"-# ⚡ {elapsed:.1f} วิ · {result.model}"
+        if result.backup:
+            info += " · 🛟 สำรอง"
         if result.searched:
             info += " · 🔎 ค้นเว็บ"
         if result.sources:
