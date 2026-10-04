@@ -37,6 +37,7 @@ class AnswerContext:
     attachments_text: str = ""  # เนื้อหาไฟล์ที่แนบมา (ส่งให้ AI แต่ไม่เก็บลงความจำ)
     file_names: tuple[str, ...] = ()
     use_memory: bool = True  # False = คำถามเดี่ยว ไม่อ่าน/ไม่บันทึกความจำของช่อง (เช่น เมนูคลิกขวา)
+    quote: str = ""  # ข้อความที่ผู้ถาม reply ไว้ (เก็บไว้ใช้ตอนแก้คำถาม)
     ok: bool = False
     prompt: str = ""
     answer: str = ""

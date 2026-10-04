@@ -68,7 +68,16 @@ class FakeChannel:
         self.log.append(("rename", kwargs.get("name")))
 
     def get_partial_message(self, message_id):
-        return types.SimpleNamespace(delete=lambda: None)
+        log = self.log
+
+        async def delete():
+            log.append(("delete", message_id))
+
+        async def edit(**kwargs):
+            log.append(("edit", kwargs.get("content"), bool(kwargs.get("view"))))
+            return FakeMessage(log, kwargs.get("content"))
+
+        return types.SimpleNamespace(delete=delete, edit=edit)
 
 
 class FakeAI:
@@ -189,4 +198,28 @@ def test_answer_buttons(env):
     good, bad = run(scenario())
     assert good == ["ตอบใหม่", "เขียนต่อ", "ลบ", "สั้นลง", "ละเอียดขึ้น", "แปลอังกฤษ"]
     assert bad == ["ลองใหม่", "ลบ"]
+    bot.db.close()
+
+
+def test_edit_question_updates_answer(env):
+    bot = make_bot(env)  # cooldown ปกติ 10 วิ — แก้คำถามทันทีต้องไม่ติด cooldown
+    log = []
+    channel = FakeChannel(log)
+
+    async def scenario():
+        question = FakeMessage(log, "เมืองหลวงของญี่ปุ่น", channel)
+        await bot.on_message(question)
+        bot.ai.text = "โตเกียว"
+        before = FakeMessage(log, question.content, channel)
+        question.content = "เมืองหลวงของเกาหลีใต้"
+        await bot.on_message_edit(before, question)
+        # เนื้อหาเท่าเดิม (เช่น Discord โหลดพรีวิวลิงก์) → ไม่ตอบซ้ำ
+        await bot.on_message_edit(question, question)
+
+    run(scenario())
+    assert bot.ai.prompts == ["ปีเตอร์: เมืองหลวงของญี่ปุ่น", "ปีเตอร์: เมืองหลวงของเกาหลีใต้"]
+    edits = [entry for entry in log if entry[0] == "edit"]
+    assert len(edits) == 1 and edits[0][1].startswith(main.EDITED_HEADER + "โตเกียว") and edits[0][2]
+    # ความจำของห้องเหลือแค่คำถามใหม่
+    assert [m.content for m in bot.memory.get(111)] == ["ปีเตอร์: เมืองหลวงของเกาหลีใต้", "โตเกียว"]
     bot.db.close()

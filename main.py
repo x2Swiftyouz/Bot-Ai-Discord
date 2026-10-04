@@ -12,6 +12,7 @@ import logging
 import re
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -107,6 +108,8 @@ MAX_NOTES = 10
 MAX_NOTE_LENGTH = 200
 REACT_THINKING = "👀"
 REACT_ERROR = "⚠️"
+EDITED_HEADER = "-# ✏️ ตอบใหม่ตามคำถามที่แก้\n"
+MAX_TRACKED_ANSWERS = 300
 BRAND_COLOR = discord.Color.from_rgb(88, 101, 242)
 
 # ส่งข้อความ 1 ก้อน (พร้อมปุ่มถ้ามี) แล้วคืนข้อความที่ส่งไป
@@ -139,6 +142,8 @@ class AIChatBot(discord.Client):
             # แจ้งเข้าห้อง log เมื่อสลับไปตัวสำรอง / AI ใช้ไม่ได้ทุกตัว
             self.ai.on_event = self.admin_log.status
         self.answer_count = 0
+        # id ข้อความคำถาม → ปุ่มใต้คำตอบ (ใช้ตอนผู้ใช้แก้คำถาม แล้วให้บอทแก้คำตอบตาม)
+        self._answer_views: OrderedDict[int, AnswerView] = OrderedDict()
         self._cleaned_commands = False
         self._background: set[asyncio.Task] = set()
         self._statuses = itertools.cycle(self._status_texts())
@@ -454,8 +459,8 @@ class AIChatBot(discord.Client):
         send: Sender,
         existing: discord.Message | discord.WebhookMessage | None = None,
         buttons: bool = True,
-    ) -> None:
-        """ส่งคำตอบ (ตัดเป็นหลายข้อความถ้ายาว) พร้อมปุ่มใต้ข้อความสุดท้าย
+    ) -> AnswerView | None:
+        """ส่งคำตอบ (ตัดเป็นหลายข้อความถ้ายาว) พร้อมปุ่มใต้ข้อความสุดท้าย คืนปุ่ม (None ถ้าส่งไม่สำเร็จ)
 
         existing: ข้อความ preview จาก streaming — จะถูกแก้เป็นก้อนแรกของคำตอบแทนการส่งใหม่
         """
@@ -488,6 +493,8 @@ class AIChatBot(discord.Client):
                 await send("⚠️ AI ตอบแล้วแต่ส่งคำตอบไม่สำเร็จ ลองกด 🔄 หรือถามใหม่อีกครั้งนะ", None)
             except discord.HTTPException:
                 pass
+            return None
+        return view
 
     async def _send_chunks(
         self,
@@ -644,7 +651,7 @@ class AIChatBot(discord.Client):
         perms = user.guild_permissions
         return perms.administrator or perms.manage_guild
 
-    def _limit_message(self, user: discord.abc.User) -> str | None:
+    def _limit_message(self, user: discord.abc.User, cooldown: bool = True) -> str | None:
         """เช็กโควต้ารายวันก่อน แล้วค่อยเช็ก cooldown คืนข้อความแจ้งผู้ใช้ถ้าถามไม่ได้"""
         limit = self.config.daily_limit
         if limit and not self._is_exempt(user):
@@ -654,7 +661,7 @@ class AIChatBot(discord.Client):
                     key=f"quota:{self._today()}:{user.id}", cooldown=86400,
                 )
                 return f"📊 วันนี้คุณถามครบ {limit} คำถามแล้ว โควต้าจะรีเซ็ตตอนเที่ยงคืน แล้วเจอกันพรุ่งนี้นะ 🙏"
-        return self._cooldown_message(user.id)
+        return self._cooldown_message(user.id) if cooldown else None
 
     def _cooldown_message(self, user_id: int) -> str | None:
         remaining = self.cooldown.check(user_id)
@@ -742,7 +749,7 @@ class AIChatBot(discord.Client):
             images=tuple(images), header="",
             guild_id=message.guild.id if message.guild else None,
             exempt=self._is_exempt(message.author), search_query=typed,
-            attachments_text=file_text, file_names=file_names,
+            attachments_text=file_text, file_names=file_names, quote=quote,
         )
         if heard:
             # ให้ผู้ใช้เห็นว่าบอทได้ยินว่าอะไร (เผื่อถอดเสียงผิด)
@@ -771,12 +778,85 @@ class AIChatBot(discord.Client):
             await self._react(message, REACT_ERROR)
         # มี preview แล้ว = ส่งข้อความแรกไปแล้ว ข้อความที่เหลือส่งต่อท้ายธรรมดา
         sender = self._channel_sender(target, reply_to=None if existing else reply_to)
-        await self._deliver(ctx, sender, existing)
+        view = await self._deliver(ctx, sender, existing)
+        if view is not None and not heard:
+            self._answer_views[message.id] = view
+            while len(self._answer_views) > MAX_TRACKED_ANSWERS:
+                self._answer_views.popitem(last=False)
         if new_thread is not None and ctx.ok and self.config.thread_auto_title:
             # ตั้งชื่อเธรดให้ตรงเรื่องเบื้องหลัง ไม่ต้องรอ
             task = asyncio.get_running_loop().create_task(self._auto_title(new_thread, ctx))
             self._background.add(task)
             task.add_done_callback(self._background.discard)
+
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        """แก้ข้อความคำถาม → บอทแก้คำตอบเดิมให้ตรงกับคำถามใหม่ (ระหว่างที่ปุ่มใต้คำตอบยังใช้ได้)"""
+        view = self._answer_views.get(after.id)
+        if view is None or self.user is None or before.content == after.content:
+            return  # เนื้อหาเท่าเดิม = Discord แก้เองตอนโหลดพรีวิวลิงก์ ไม่ใช่ผู้ใช้แก้
+        if view.is_finished():
+            self._answer_views.pop(after.id, None)
+            return
+        typed = re.sub(rf"<@!?{self.user.id}>", "", after.content).strip()
+        if not typed or typed.startswith(IGNORE_PREFIX) or typed == view.ctx.search_query or view.busy:
+            return
+        # แก้คำผิดทันทีหลังถามเป็นเรื่องปกติ จึงไม่ติด cooldown (แต่ยังนับโควต้ารายวัน)
+        if wait_msg := self._limit_message(after.author, cooldown=False):
+            await after.reply(wait_msg, delete_after=10)
+            return
+        view.busy = True
+        try:
+            await self._answer_edited(after, view, typed)
+        finally:
+            view.busy = False
+
+    async def _answer_edited(self, message: discord.Message, view: AnswerView, typed: str) -> None:
+        ctx = view.ctx
+        if ctx.ok:
+            self.memory.remove_exchange(ctx.channel_id, ctx.prompt, ctx.answer)
+        ctx.question = f"{ctx.quote}\n{typed}" if ctx.quote else typed
+        ctx.search_query = typed
+        ctx.header = EDITED_HEADER
+        await self._react(message, REACT_THINKING)
+        async with ctx.channel.typing():
+            await self._run(ctx)
+        await self._unreact(message, REACT_THINKING)
+        if ctx.ok:
+            await self._unreact(message, REACT_ERROR)
+        else:
+            await self._react(message, REACT_ERROR)
+        view.refresh()
+        try:
+            await self._replace_answer(ctx, view)
+        except discord.HTTPException as e:
+            log.warning("แก้คำตอบตามคำถามที่แก้ไม่สำเร็จ: %r", e)
+
+    async def _replace_answer(self, ctx: AnswerContext, view: AnswerView) -> None:
+        """แก้ข้อความคำตอบเดิมเป็นคำตอบใหม่: ข้อความแรกแก้ในที่เดิม ที่เหลือลบแล้วส่งใหม่"""
+        chunks, file = self._render(ctx)
+        if not ctx.message_ids:
+            await self._send_chunks(ctx, self._channel_sender(ctx.channel), None, view, chunks, file)
+            return
+        first_id, *rest = ctx.message_ids
+        await self._delete_messages(ctx, rest)
+        single = len(chunks) == 1
+        # attachments=[] ลบไฟล์ของคำตอบเดิม (ถ้ามี) ออกด้วย
+        first = await ctx.channel.get_partial_message(first_id).edit(  # type: ignore[attr-defined]
+            content=chunks[0], view=view if single else None,
+            attachments=[file] if file and single else [],
+        )
+        ctx.message_ids = [first_id]
+        if single:
+            view.message = first
+        for i, chunk in enumerate(chunks[1:], start=1):
+            last = i == len(chunks) - 1
+            kwargs: dict = {"view": view} if last else {}
+            if last and file:
+                kwargs["file"] = file
+            msg = await ctx.channel.send(chunk, **kwargs)
+            ctx.message_ids.append(msg.id)
+            if last:
+                view.message = msg
 
     async def _auto_title(self, thread: discord.Thread, ctx: AnswerContext) -> None:
         """ให้ AI ตั้งชื่อเธรดสั้น ๆ ตามคำถาม + คำตอบแรก (ไม่นับโควต้าผู้ใช้)"""
@@ -1307,7 +1387,7 @@ class AIChatBot(discord.Client):
             )
         embed.add_field(
             name="🔘 ปุ่มใต้คำตอบ",
-            value="🔄 ตอบใหม่ · ➡️ เขียนต่อ · 🗑️ ลบ · 📝 สั้นลง · 📖 ละเอียดขึ้น · 🌐 แปล\n-# ใช้ได้ 10 นาที เฉพาะคนถาม",
+            value="🔄 ตอบใหม่ · ➡️ เขียนต่อ · 🗑️ ลบ · 📝 สั้นลง · 📖 ละเอียดขึ้น · 🌐 แปล\n✏️ แก้ข้อความคำถาม → บอทแก้คำตอบให้ตาม\n-# ใช้ได้ 10 นาที เฉพาะคนถาม",
             inline=False,
         )
         embed.add_field(
