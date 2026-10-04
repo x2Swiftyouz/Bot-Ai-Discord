@@ -34,6 +34,8 @@ class AnswerContext:
     guild_id: int | None = None
     exempt: bool = False  # แอดมิน ไม่ถูกจำกัดโควต้ารายวัน
     search_query: str = ""  # ข้อความที่ผู้ใช้พิมพ์จริง ใช้ตัดสินใจ/ค้นเว็บ (ว่าง = ไม่ค้น)
+    attachments_text: str = ""  # เนื้อหาไฟล์ที่แนบมา (ส่งให้ AI แต่ไม่เก็บลงความจำ)
+    file_names: tuple[str, ...] = ()
     use_memory: bool = True  # False = คำถามเดี่ยว ไม่อ่าน/ไม่บันทึกความจำของช่อง (เช่น เมนูคลิกขวา)
     ok: bool = False
     prompt: str = ""
@@ -132,3 +134,44 @@ class AnswerView(discord.ui.View):
         await self.bot.followup_answer(
             interaction, self, "to_english" if self.answer_is_thai else "to_thai"
         )
+
+
+class CloseThreadView(discord.ui.View):
+    """ปุ่ม 🔒 ปิดเธรด ในเธรดที่บอทเปิดให้ (โหมดเธรด)
+
+    เป็นปุ่มถาวร (timeout=None + custom_id คงที่) จึงยังกดได้แม้บอทรีสตาร์ท
+    ปิด = archive เธรด ถ้ามีคนพิมพ์ในเธรดอีก Discord จะเปิดเธรดกลับมาเอง
+    """
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="ปิดเธรด", emoji="🔒", style=discord.ButtonStyle.secondary, custom_id="ai:close_thread"
+    )
+    async def close(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        thread = interaction.channel
+        if not isinstance(thread, discord.Thread):
+            await interaction.response.send_message("ปุ่มนี้ใช้ได้ในเธรดเท่านั้น", ephemeral=True)
+            return
+        user = interaction.user
+        allowed = isinstance(user, discord.Member) and thread.permissions_for(user).manage_threads
+        if not allowed and thread.parent is not None:
+            # เธรดที่เปิดจากข้อความ มี id เดียวกับข้อความเริ่มต้น → คนถามคนแรกปิดได้
+            try:
+                starter = await thread.parent.fetch_message(thread.id)  # type: ignore[union-attr]
+                allowed = starter.author.id == user.id
+            except discord.HTTPException:
+                pass
+        if not allowed:
+            await interaction.response.send_message(
+                "ปิดเธรดได้เฉพาะคนที่เริ่มถาม หรือคนที่มีสิทธิ์ Manage Threads นะ", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            f"🔒 {user.display_name} ปิดเธรดนี้แล้ว — พิมพ์ในเธรดเพื่อคุยต่อได้ทุกเมื่อ"
+        )
+        try:
+            await thread.edit(archived=True)
+        except discord.HTTPException as e:
+            log.warning("ปิดเธรดไม่ได้: %r", e)

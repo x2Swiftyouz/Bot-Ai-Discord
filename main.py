@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import io
 import itertools
 import logging
 import re
@@ -25,7 +27,7 @@ from bot.adminlog import AdminLog
 from bot.channels import AIChannelStore
 from bot.config import Config, ConfigError
 from bot.cooldown import UserCooldown
-from bot.media import is_image, read_images
+from bot.media import is_document, is_image, read_documents, read_images
 from bot.memory import ChannelMemory
 from bot.providers import (
     CURRENT_PERSONA, CURRENT_USER_NOTES, AIError, AIProvider, BackupProvider, ImageData, OnDelta, create_provider,
@@ -34,7 +36,7 @@ from bot.search import SearchError, TavilySearch, format_results, should_search
 from bot.storage import Database
 from bot.streaming import StreamPreview
 from bot.utils import now_text, redact, split_message
-from bot.views import AnswerContext, AnswerView
+from bot.views import AnswerContext, AnswerView, CloseThreadView
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,6 +69,7 @@ REPLY_MENTIONS = discord.AllowedMentions(
 # ข้อความในห้องคุยกับ AI ที่ขึ้นต้นด้วยสิ่งนี้ บอทจะไม่ตอบ (ไว้คุยกันเอง)
 IGNORE_PREFIX = "//"
 IMAGE_ONLY_QUESTION = "ช่วยอธิบายรูปนี้หน่อย"
+FILE_ONLY_QUESTION = "ช่วยสรุปไฟล์นี้หน่อย"
 REPLY_ONLY_QUESTION = "ช่วยอธิบายหรือตอบข้อความนี้หน่อย"
 MAX_SOURCES = 3
 CONTINUE_QUESTION = "เขียนต่อจากคำตอบก่อนหน้าให้จบ ต่อจากจุดที่ค้างไว้เลย ไม่ต้องทวนซ้ำ"
@@ -103,7 +106,9 @@ REACT_ERROR = "⚠️"
 BRAND_COLOR = discord.Color.from_rgb(88, 101, 242)
 
 # ส่งข้อความ 1 ก้อน (พร้อมปุ่มถ้ามี) แล้วคืนข้อความที่ส่งไป
-Sender = Callable[[str, "discord.ui.View | None"], Awaitable["discord.Message | discord.WebhookMessage"]]
+# (ข้อความ, ปุ่ม, ไฟล์แนบ) -> ข้อความที่ส่งไป
+Sender = Callable[..., Awaitable["discord.Message | discord.WebhookMessage"]]
+LONG_ANSWER_PREVIEW = 1500
 
 
 class AIChatBot(discord.Client):
@@ -128,6 +133,7 @@ class AIChatBot(discord.Client):
             self.ai.on_event = lambda key, message: self.admin_log.post(message, key=key)
         self.answer_count = 0
         self._cleaned_commands = False
+        self._background: set[asyncio.Task] = set()
         self._statuses = itertools.cycle(self._status_texts())
         self._register_commands()
 
@@ -142,6 +148,8 @@ class AIChatBot(discord.Client):
         else:
             synced = await self.tree.sync()
             log.info("Synced %d global command(s) (อาจใช้เวลาสักพักกว่าจะขึ้น)", len(synced))
+        # ปุ่มถาวร (🔒 ปิดเธรด) ต้องลงทะเบียนทุกครั้งที่เริ่มบอท ถึงจะกดได้หลังรีสตาร์ท
+        self.add_view(CloseThreadView())
         self.rotate_status.start()
         self.daily_summary.change_interval(time=dtime(0, 0, tzinfo=ZoneInfo(self.config.timezone)))
         self.daily_summary.start()
@@ -246,6 +254,10 @@ class AIChatBot(discord.Client):
         prompt = f"{ctx.asker_name}: {ctx.question}"
         # ความจำเก็บแค่คำถาม ไม่เก็บรูปหรือผลค้นเว็บ (ประหยัดโควต้า) จึงจดไว้ว่ามีรูปแนบ
         ctx.prompt = prompt + (f" [แนบรูป {len(ctx.images)} รูป]" if ctx.images else "")
+        if ctx.file_names:
+            ctx.prompt += f" [แนบไฟล์: {', '.join(ctx.file_names)}]"
+        if ctx.attachments_text:
+            prompt += "\n\n" + ctx.attachments_text
         ctx.footer = ""
         # บุคลิกของห้อง (/persona) — ใช้แทน SYSTEM_PROMPT ระหว่างคำถามนี้
         persona_token = CURRENT_PERSONA.set(self._persona_prompt(ctx) if ctx.use_memory else None)
@@ -369,9 +381,22 @@ class AIChatBot(discord.Client):
             existing = await preview.finish()
         return existing
 
+    def _render(self, ctx: AnswerContext) -> tuple[list[str], discord.File | None]:
+        """แบ่งคำตอบเป็นข้อความ ถ้ายาวมาก (LONG_ANSWER_FILE_CHARS) แสดงส่วนต้น + แนบฉบับเต็มเป็นไฟล์ .txt"""
+        footer = f"\n{ctx.footer}" if ctx.footer else ""
+        limit = self.config.long_answer_file_chars
+        if ctx.ok and limit and len(ctx.answer) > limit:
+            preview = split_message(ctx.answer, LONG_ANSWER_PREVIEW)[0]
+            text = (
+                f"{ctx.header}{preview}\n…\n"
+                f"-# 📄 คำตอบยาว {len(ctx.answer):,} ตัวอักษร — ฉบับเต็มอยู่ในไฟล์แนบ{footer}"
+            )
+            file = discord.File(io.BytesIO(ctx.answer.encode("utf-8")), filename="answer.txt")
+            return split_message(text), file
+        return split_message(ctx.header + ctx.answer + footer) or ["(AI ไม่ได้ส่งข้อความกลับมา)"], None
+
     def _chunks(self, ctx: AnswerContext) -> list[str]:
-        text = ctx.header + ctx.answer + (f"\n{ctx.footer}" if ctx.footer else "")
-        return split_message(text) or ["(AI ไม่ได้ส่งข้อความกลับมา)"]
+        return self._render(ctx)[0]
 
     async def _deliver(
         self,
@@ -385,15 +410,17 @@ class AIChatBot(discord.Client):
         existing: ข้อความ preview จาก streaming — จะถูกแก้เป็นก้อนแรกของคำตอบแทนการส่งใหม่
         """
         view = AnswerView(self, ctx) if buttons else None
-        chunks = self._chunks(ctx)
+        chunks, file = self._render(ctx)
         try:
             for i, chunk in enumerate(chunks):
                 last = i == len(chunks) - 1
+                attach = file if last else None
                 if i == 0 and existing is not None:
-                    await existing.edit(content=chunk, view=view if last else None)
+                    extra = {"attachments": [attach]} if attach else {}
+                    await existing.edit(content=chunk, view=view if last else None, **extra)
                     msg = existing
                 else:
-                    msg = await send(chunk, view if last else None)
+                    msg = await send(chunk, view if last else None, attach)
                 ctx.message_ids.append(msg.id)
                 if last and view is not None:
                     view.message = msg
@@ -407,9 +434,11 @@ class AIChatBot(discord.Client):
     ) -> Sender:
         first = True
 
-        async def send(content: str, view: discord.ui.View | None):
+        async def send(content: str, view: discord.ui.View | None, file: discord.File | None = None):
             nonlocal first
-            kwargs = {"view": view} if view else {}
+            kwargs: dict = {"view": view} if view else {}
+            if file:
+                kwargs["file"] = file
             if first and reply_to is not None:
                 first = False
                 return await reply_to.reply(content, allowed_mentions=REPLY_MENTIONS, **kwargs)
@@ -420,8 +449,10 @@ class AIChatBot(discord.Client):
 
     @staticmethod
     def _followup_sender(interaction: discord.Interaction) -> Sender:
-        async def send(content: str, view: discord.ui.View | None):
-            kwargs = {"view": view} if view else {}
+        async def send(content: str, view: discord.ui.View | None, file: discord.File | None = None):
+            kwargs: dict = {"view": view} if view else {}
+            if file:
+                kwargs["file"] = file
             return await interaction.followup.send(content, wait=True, **kwargs)
 
         return send
@@ -457,13 +488,19 @@ class AIChatBot(discord.Client):
         # ข้อความที่มีปุ่ม (ข้อความสุดท้าย) จะถูกแก้เป็นคำตอบใหม่ ส่วนข้อความอื่นของคำตอบเดิมลบทิ้ง
         source_id = interaction.message.id if interaction.message else None
         await self._delete_messages(ctx, [m for m in ctx.message_ids if m != source_id])
-        chunks = self._chunks(ctx)
+        chunks, file = self._render(ctx)
         single = len(chunks) == 1
-        await interaction.edit_original_response(content=chunks[0], view=view if single else None)
+        # attachments=[] ลบไฟล์ของคำตอบเดิม (ถ้ามี) ออกด้วย
+        await interaction.edit_original_response(
+            content=chunks[0], view=view if single else None,
+            attachments=[file] if file and single else [],
+        )
         ctx.message_ids = [source_id] if source_id else []
         for i, chunk in enumerate(chunks[1:], start=1):
             last = i == len(chunks) - 1
-            kwargs = {"view": view} if last else {}
+            kwargs: dict = {"view": view} if last else {}
+            if last and file:
+                kwargs["file"] = file
             msg = await interaction.followup.send(chunk, wait=True, **kwargs)
             ctx.message_ids.append(msg.id)
             if last:
@@ -575,7 +612,8 @@ class AIChatBot(discord.Client):
         quote, quoted_attachments = await self._replied_context(message)
         attachments = [*message.attachments, *quoted_attachments]
         has_image = self.config.max_images > 0 and any(map(is_image, attachments))
-        if not question and not has_image and not quote:
+        has_file = self.config.max_file_chars > 0 and any(map(is_document, attachments))
+        if not question and not has_image and not has_file and not quote:
             # ในห้องคุยกับ AI ข้อความที่มีแต่สติกเกอร์/ไฟล์อื่น ให้ข้ามไปเงียบ ๆ
             if not in_ai_channel:
                 await message.reply("สวัสดี! พิมพ์คำถามต่อจากการ mention ได้เลย หรือใช้ `/ask` ก็ได้ 😊")
@@ -586,21 +624,25 @@ class AIChatBot(discord.Client):
             return
 
         images: list[ImageData] = []
-        if has_image:
-            images, skipped = await read_images(
-                attachments, self.config.max_images, self.config.max_image_bytes
-            )
+        file_text, file_names = "", ()
+        if has_image or has_file:
+            images, file_text, file_names, skipped = await self._read_attachments(attachments)
             if skipped:
                 await message.reply(
-                    "📷 ข้ามรูปเหล่านี้: " + ", ".join(skipped), delete_after=20,
+                    "📎 ข้ามไฟล์เหล่านี้: " + ", ".join(skipped), delete_after=20,
                     allowed_mentions=REPLY_MENTIONS,
                 )
-            if not images and not question and not quote:
+            if not images and not file_names and not question and not quote:
                 return
 
         typed = question
         if not question:
-            question = IMAGE_ONLY_QUESTION if images and not quote else REPLY_ONLY_QUESTION
+            if file_names:
+                question = FILE_ONLY_QUESTION
+            elif images and not quote:
+                question = IMAGE_ONLY_QUESTION
+            else:
+                question = REPLY_ONLY_QUESTION
         ctx = AnswerContext(
             channel=message.channel, channel_id=message.channel.id,
             asker_id=message.author.id, asker_name=message.author.display_name,
@@ -608,16 +650,18 @@ class AIChatBot(discord.Client):
             images=tuple(images), header="",
             guild_id=message.guild.id if message.guild else None,
             exempt=self._is_exempt(message.author), search_query=typed,
+            attachments_text=file_text, file_names=file_names,
         )
         await self._react(message, REACT_THINKING)
         # โหมดเธรด: คำถามใหม่ในห้อง AI เปิดเธรดของตัวเอง แล้วตอบในเธรด (ความจำแยกตามเธรด)
         target: discord.abc.Messageable = message.channel
         reply_to: discord.Message | None = message
+        new_thread: discord.Thread | None = None
         if in_ai_channel and self._thread_mode(message.channel):
-            thread = await self._open_thread(message, typed)
-            if thread is not None:
-                target, reply_to = thread, None
-                ctx.channel, ctx.channel_id = thread, thread.id
+            new_thread = await self._open_thread(message, typed)
+            if new_thread is not None:
+                target, reply_to = new_thread, None
+                ctx.channel, ctx.channel_id = new_thread, new_thread.id
 
         def start(content: str):
             if reply_to is None:
@@ -633,6 +677,31 @@ class AIChatBot(discord.Client):
         # มี preview แล้ว = ส่งข้อความแรกไปแล้ว ข้อความที่เหลือส่งต่อท้ายธรรมดา
         sender = self._channel_sender(target, reply_to=None if existing else reply_to)
         await self._deliver(ctx, sender, existing)
+        if new_thread is not None and ctx.ok and self.config.thread_auto_title:
+            # ตั้งชื่อเธรดให้ตรงเรื่องเบื้องหลัง ไม่ต้องรอ
+            task = asyncio.get_running_loop().create_task(self._auto_title(new_thread, ctx))
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
+
+    async def _auto_title(self, thread: discord.Thread, ctx: AnswerContext) -> None:
+        """ให้ AI ตั้งชื่อเธรดสั้น ๆ ตามคำถาม + คำตอบแรก (ไม่นับโควต้าผู้ใช้)"""
+        prompt = (
+            "ตั้งชื่อหัวข้อสั้น ๆ ไม่เกิน 6 คำ ให้กับบทสนทนาด้านล่าง ใช้ภาษาเดียวกับคำถาม "
+            "ตอบเฉพาะชื่อหัวข้อบรรทัดเดียว ไม่ใส่เครื่องหมายคำพูด อีโมจิ หรือคำอธิบาย\n\n"
+            f"คำถาม: {(ctx.search_query or ctx.question)[:500]}\nคำตอบ: {ctx.answer[:800]}"
+        )
+        try:
+            result = await self.ai.generate([], prompt)
+        except AIError as e:
+            log.info("ตั้งชื่อเธรดไม่สำเร็จ: %r", e)
+            return
+        title = result.text.strip().splitlines()[0].strip(" \"'“”‘’*#`.:")[:80] if result.text.strip() else ""
+        if not title:
+            return
+        try:
+            await thread.edit(name=f"💬 {title}")
+        except discord.HTTPException as e:
+            log.info("เปลี่ยนชื่อเธรดไม่ได้: %r", e)
 
     def _thread_mode(self, channel: discord.abc.Messageable) -> bool:
         if isinstance(channel, discord.Thread) or not isinstance(channel, discord.TextChannel):
@@ -641,12 +710,40 @@ class AIChatBot(discord.Client):
 
     async def _open_thread(self, message: discord.Message, typed: str) -> discord.Thread | None:
         """เปิดเธรดจากข้อความคำถาม (ต้องมีสิทธิ์ Create Public Threads) — ไม่ได้ก็ตอบในห้องปกติ"""
-        title = " ".join(typed.split())[:80] or "📷 คำถามรูปภาพ"
+        title = " ".join(typed.split())[:80] or "📎 คำถามพร้อมไฟล์แนบ"
         try:
-            return await message.create_thread(name=f"💬 {title}", auto_archive_duration=60)
+            thread = await message.create_thread(name=f"💬 {title}", auto_archive_duration=60)
         except discord.HTTPException as e:
             log.warning("เปิดเธรดไม่ได้ (ขาดสิทธิ์ Create Public Threads?): %r", e)
             return None
+        try:
+            await thread.send(
+                "-# 🧵 คุยต่อในเธรดนี้ได้เลย บอทจำบทสนทนาแยกเฉพาะเธรดนี้ · กด 🔒 เมื่อคุยจบ",
+                view=CloseThreadView(),
+            )
+        except discord.HTTPException:
+            pass
+        return thread
+
+    async def _read_attachments(
+        self, attachments: list[discord.Attachment]
+    ) -> tuple[list[ImageData], str, tuple[str, ...], list[str]]:
+        """อ่านรูป + ไฟล์เอกสารที่แนบมา คืน (รูป/PDF สแกน, เนื้อหาไฟล์, ชื่อไฟล์, เหตุผลที่ข้าม)"""
+        images: list[ImageData] = []
+        skipped: list[str] = []
+        if self.config.max_images and any(map(is_image, attachments)):
+            images, skipped = await read_images(
+                attachments, self.config.max_images, self.config.max_image_bytes
+            )
+        text, names = "", ()
+        if self.config.max_file_chars and any(map(is_document, attachments)):
+            text, pdfs, name_list, doc_skipped = await read_documents(
+                attachments, self.config.max_file_bytes, self.config.max_file_chars
+            )
+            images += pdfs
+            names = tuple(name_list)
+            skipped += doc_skipped
+        return images, text, names, skipped
 
     async def _replied_context(
         self, message: discord.Message
@@ -684,7 +781,7 @@ class AIChatBot(discord.Client):
             parts += [embed.title or "", embed.description or ""]
             parts += [f"{f.name}: {f.value}" for f in embed.fields[:10]]
         text = "\n".join(p for p in parts if p)[:limit]
-        return text, [a for a in message.attachments if is_image(a)]
+        return text, [a for a in message.attachments if is_image(a) or is_document(a)]
 
     async def message_action(
         self, interaction: discord.Interaction, message: discord.Message, action: str
@@ -701,13 +798,9 @@ class AIChatBot(discord.Client):
             )
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        images: list[ImageData] = []
-        if attachments and self.config.max_images:
-            images, _ = await read_images(
-                attachments, self.config.max_images, self.config.max_image_bytes
-            )
+        images, file_text, file_names, _ = await self._read_attachments(attachments)
         who = message.author.display_name
-        question = f"{instruction}\n\n[ข้อความจาก {who}]:\n{text or '(มีแต่รูป)'}"
+        question = f"{instruction}\n\n[ข้อความจาก {who}]:\n{text or '(มีแต่ไฟล์แนบ)'}"
         ctx = AnswerContext(
             channel=interaction.channel,  # type: ignore[arg-type]
             channel_id=interaction.channel_id or interaction.user.id,
@@ -715,11 +808,14 @@ class AIChatBot(discord.Client):
             question=question, images=tuple(images),
             header=f"-# {label} ข้อความของ {who} · {message.jump_url}\n",
             guild_id=interaction.guild_id, exempt=self._is_exempt(interaction.user),
-            use_memory=False,
+            attachments_text=file_text, file_names=file_names, use_memory=False,
         )
 
-        async def send(content: str, view: discord.ui.View | None = None):
-            return await interaction.followup.send(content, ephemeral=True, wait=True)
+        async def send(
+            content: str, view: discord.ui.View | None = None, file: discord.File | None = None
+        ):
+            extra = {"file": file} if file else {}
+            return await interaction.followup.send(content, ephemeral=True, wait=True, **extra)
 
         existing = await self._run_streaming(ctx, lambda content: send(content))
         await self._deliver(ctx, send, existing, buttons=False)
@@ -743,11 +839,11 @@ class AIChatBot(discord.Client):
 
     def _register_commands(self) -> None:
         @self.tree.command(name="ask", description="ถามคำถามกับ AI")
-        @app_commands.describe(question="คำถามของคุณ", image="(ไม่บังคับ) แนบรูปให้ AI ดู")
+        @app_commands.describe(question="คำถามของคุณ", file="(ไม่บังคับ) แนบรูป / PDF / ไฟล์ข้อความหรือโค้ด")
         async def ask(
             interaction: discord.Interaction,
             question: str,
-            image: discord.Attachment | None = None,
+            file: discord.Attachment | None = None,
         ) -> None:
             if wait_msg := self._limit_message(interaction.user):
                 await interaction.response.send_message(wait_msg, ephemeral=True)
@@ -756,19 +852,16 @@ class AIChatBot(discord.Client):
             # defer: บอก Discord ว่ากำลังประมวลผล (ขึ้น "กำลังคิด...") และขยายเวลาตอบจาก 3 วินาทีเป็น 15 นาที
             await interaction.response.defer(thinking=True)
             images: list[ImageData] = []
-            note = ""
-            if image is not None:
-                if self.config.max_images == 0:
-                    note = "\n-# 📷 ผู้ดูแลปิดการอ่านรูปไว้"
-                else:
-                    images, skipped = await read_images(
-                        [image], self.config.max_images, self.config.max_image_bytes
-                    )
-                    if skipped:
-                        note = "\n-# 📷 ข้ามรูป: " + ", ".join(skipped)
+            file_text, file_names, note = "", (), ""
+            if file is not None:
+                images, file_text, file_names, skipped = await self._read_attachments([file])
+                if skipped:
+                    note = "\n-# 📎 ข้ามไฟล์: " + ", ".join(skipped)
+                elif not images and not file_names:
+                    note = "\n-# 📎 ไฟล์ชนิดนี้ยังอ่านไม่ได้ (รองรับรูป, PDF, ไฟล์ข้อความ/โค้ด)"
 
             # แสดงคำถามด้วย เพราะคนอื่นในช่องจะไม่เห็นว่าถามอะไร
-            attached = " 📷" if images else ""
+            attached = f" 📎 {', '.join(file_names)}" if file_names else (" 📷" if images else "")
             header = f"> **{interaction.user.display_name}:** {question[:300]}{attached}{note}\n\n"
             ctx = AnswerContext(
                 channel=interaction.channel,  # type: ignore[arg-type]
@@ -776,7 +869,7 @@ class AIChatBot(discord.Client):
                 asker_id=interaction.user.id, asker_name=interaction.user.display_name,
                 question=question, images=tuple(images), header=header,
                 guild_id=interaction.guild_id, exempt=self._is_exempt(interaction.user),
-                search_query=question,
+                search_query=question, attachments_text=file_text, file_names=file_names,
             )
             existing = await self._run_streaming(
                 ctx, lambda content: interaction.followup.send(content, wait=True)

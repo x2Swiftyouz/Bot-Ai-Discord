@@ -137,6 +137,10 @@ class Config:
     memory_size: int
     max_images: int
     max_image_bytes: int
+    max_file_bytes: int
+    max_file_chars: int
+    long_answer_file_chars: int
+    thread_auto_title: bool
     user_cooldown: float
     ai_timeout: float
     temperature: float
@@ -223,6 +227,10 @@ class Config:
             memory_size=max(1, _get_int("MEMORY_SIZE", 10)),
             max_images=max(0, _get_int("MAX_IMAGES", 4)),
             max_image_bytes=int(max(0.1, _get_float("MAX_IMAGE_MB", 5)) * 1024 * 1024),
+            max_file_bytes=int(max(0.1, _get_float("MAX_FILE_MB", 10)) * 1024 * 1024),
+            max_file_chars=max(0, _get_int("MAX_FILE_CHARS", 40000)),
+            long_answer_file_chars=max(0, _get_int("LONG_ANSWER_FILE_CHARS", 4000)),
+            thread_auto_title=_get_bool("THREAD_AUTO_TITLE", True),
             user_cooldown=max(0.0, _get_float("USER_COOLDOWN_SECONDS", 10)),
             ai_timeout=max(5.0, _get_float("AI_TIMEOUT_SECONDS", 60)),
             temperature=_get_float("AI_TEMPERATURE", 0.7),

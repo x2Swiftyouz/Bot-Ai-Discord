@@ -568,6 +568,10 @@ class OpenAICompatibleProvider(AIProvider):
         messages: list[dict] = []
         messages.append({"role": "system", "content": self.build_system_prompt()})
         messages += [{"role": m.role, "content": m.content} for m in history]
+        # PDF แบบภาพสแกนส่งได้เฉพาะ Gemini — เจ้าอื่นส่งเฉพาะรูป
+        if any(not img.mime_type.startswith("image/") for img in images):
+            prompt += "\n\n(มีไฟล์ PDF แนบมาแต่โมเดลนี้อ่านไฟล์ PDF แบบภาพสแกนไม่ได้)"
+            images = [img for img in images if img.mime_type.startswith("image/")]
         if images:
             # ต้องใช้โมเดลที่รองรับรูป (vision) ไม่งั้น API จะตอบ error กลับมา
             content: str | list[dict] = [{"type": "text", "text": prompt}] + [
