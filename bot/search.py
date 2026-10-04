@@ -21,7 +21,12 @@ _NEEDS_SEARCH = re.compile(
     r"|ราคา|ค่าเงิน|อัตราแลกเปลี่ยน|หุ้น|คริปโต|บิทคอยน์|ทองคำ|ราคาทอง|น้ำมัน"
     r"|ผลบอล|ผลการแข่ง|ตารางคะแนน|สภาพอากาศ|พยากรณ์อากาศ|พายุ|แผ่นดินไหว|น้ำท่วม"
     r"|เปิดตัว|วางขาย|เวอร์ชันใหม่|เวอร์ชั่นใหม่|อีเวนต์|คอนเสิร์ต"
-    r"|\b(news|latest|price|weather|forecast|score|release[ds]?|update[ds]?)\b",
+    # เกม / รีวิว / สถานที่ — ข้อมูลเปลี่ยนบ่อย หรือ AI มักเดาผิด
+    r"|ตั้งค่า|สเปค|สเปก|แพทช์|ซีซั่น|เมต้า|โค้ดรีดีม|รีดีม|รีวิว|ร้าน.{0,10}(แถว|ใกล้)|ที่เที่ยว"
+    # คลิป / วิดีโอ — ค้นแล้วส่งลิงก์ให้
+    r"|คลิป|วิดีโอ|วีดีโอ|ยูทูป|ยูทูบ|ติ๊กต็อก"
+    r"|\b(news|latest|price|weather|forecast|score|release[ds]?|update[ds]?|patch|season|meta"
+    r"|settings?|specs?|review|video|youtube|tiktok|redeem)\b",
     re.IGNORECASE,
 )
 # คำถามเรื่องวันเวลาตอบได้จากนาฬิกาของบอทอยู่แล้ว ไม่ต้องค้นเว็บ
@@ -31,12 +36,17 @@ _DATE_ONLY = re.compile(
     re.IGNORECASE,
 )
 _FORCE_PREFIX = re.compile(r"^\s*(ค้นหา|ค้นเว็บ|search)\s*[:：]?\s*", re.IGNORECASE)
+# ขึ้นต้นด้วย "หา..." / "ช่วยหา..." = ขอให้ไปหาข้อมูล (ไม่นับ "หาร" "หาย")
+_FIND_PREFIX = re.compile(r"^\s*(ช่วย|รบกวน)?\s*(หา|ค้น)(?![รย])", re.IGNORECASE)
+_VIDEO = re.compile(r"คลิป|วิดีโอ|วีดีโอ|ยูทูป|ยูทูบ|ติ๊กต็อก|\b(video|youtube|tiktok)\b", re.IGNORECASE)
+# คำถามสั้น ๆ อย่าง "หาคลิปให้หน่อย" ต้องเอาหัวข้อจากคำถามก่อนหน้ามาค้นด้วย
+SHORT_QUERY = 25
 _NEWS = re.compile(r"ข่าว|\bnews\b", re.IGNORECASE)
 
 
 def should_search(question: str) -> bool:
     text = question.strip()
-    if _FORCE_PREFIX.match(text):
+    if _FORCE_PREFIX.match(text) or _FIND_PREFIX.match(text):
         return True
     if _DATE_ONLY.match(text):
         return False
@@ -67,14 +77,21 @@ class TavilySearch:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def search(self, question: str) -> list[SearchResult]:
-        query = _FORCE_PREFIX.sub("", question).strip()[:400]
-        payload = {
+    async def search(self, question: str, context: str = "") -> list[SearchResult]:
+        """context: คำถามก่อนหน้าในห้อง ใช้เติมหัวข้อเมื่อคำถามนี้สั้นและกว้างเกินไป"""
+        query = _FORCE_PREFIX.sub("", question).strip()
+        if context and len(query) < SHORT_QUERY:
+            query = f"{context.strip()[:300]} {query}"
+        query = query[:400]
+        payload: dict = {
             "query": query,
             "max_results": self.max_results,
             "search_depth": "basic",
             "topic": "news" if _NEWS.search(query) else "general",
         }
+        if _VIDEO.search(query):
+            # ขอคลิป → ค้นเฉพาะเว็บวิดีโอ จะได้ลิงก์คลิปจริง
+            payload["include_domains"] = ["youtube.com", "tiktok.com"]
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=self._timeout)
         try:
