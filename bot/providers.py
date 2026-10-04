@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -123,6 +124,10 @@ class AIProvider(ABC):
         try:
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status == 429:
+                    # ข้อความใน body บอกว่าโควต้าตัวไหนหมด (ต่อนาที / ต่อวัน / ค้นเว็บ)
+                    log.warning(
+                        "%s HTTP 429 (model %s): %s", self.name, model, (await resp.text())[:800]
+                    )
                     raise RateLimitError(_parse_retry_after(resp.headers))
                 if resp.status in (401, 403):
                     log.error("%s auth error %s: %s", self.name, resp.status, await resp.text())
@@ -201,11 +206,20 @@ class AIProvider(ABC):
 class GeminiProvider(AIProvider):
     name = "gemini"
     BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+    # โดน 429 ตอนค้นเว็บ → พักการค้นเว็บของโมเดลนั้นกี่วินาที
+    SEARCH_PAUSE_SECONDS = 30 * 60
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         # โมเดลที่ใช้ค้นเว็บไม่ได้ (ตอบ 400) จะไม่ขอค้นเว็บอีกจนกว่าจะรีสตาร์ท
         self._no_search_models: set[str] = set()
+        # โมเดลที่โควต้าค้นเว็บหมด: model -> เวลาที่จะลองค้นเว็บได้อีก
+        self._search_paused_until: dict[str, float] = {}
+
+    def _search_enabled(self, model: str) -> bool:
+        if not self.web_search or model in self._no_search_models:
+            return False
+        return time.monotonic() >= self._search_paused_until.get(model, 0)
 
     async def _generate(
         self,
@@ -232,7 +246,7 @@ class GeminiProvider(AIProvider):
             "generationConfig": {"temperature": self.temperature},
             "systemInstruction": {"parts": [{"text": self.build_system_prompt()}]},
         }
-        search = self.web_search and model not in self._no_search_models
+        search = self._search_enabled(model)
         if search:
             # ให้ Gemini ตัดสินใจเองว่าจะค้น Google ไหม (ค้นเฉพาะคำถามที่ต้องใช้ข้อมูลล่าสุด)
             payload["tools"] = [{"google_search": {}}]
@@ -247,6 +261,16 @@ class GeminiProvider(AIProvider):
                 raise
             log.warning("Gemini %s ใช้ค้นเว็บไม่ได้ จะตอบแบบไม่ค้นเว็บแทน", model)
             self._no_search_models.add(model)
+            payload.pop("tools")
+            data = await self._post_json(url, payload, headers, model)
+        except RateLimitError:
+            if not search:
+                raise
+            # โควต้าค้นเว็บมักหมดก่อนโควต้าปกติ ลองตอบแบบไม่ค้นเว็บอีกครั้ง
+            # ถ้ายังโดน 429 แปลว่าโควต้าปกติหมดด้วย ให้ error ส่งต่อไปตามปกติ
+            minutes = self.SEARCH_PAUSE_SECONDS // 60
+            log.warning("Gemini %s โดน 429 ตอนค้นเว็บ พักการค้นเว็บ %s นาที", model, minutes)
+            self._search_paused_until[model] = time.monotonic() + self.SEARCH_PAUSE_SECONDS
             payload.pop("tools")
             data = await self._post_json(url, payload, headers, model)
 
