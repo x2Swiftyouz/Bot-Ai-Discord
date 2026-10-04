@@ -44,6 +44,10 @@ class AIBlockedError(AIError):
     user_message = "🚫 AI ปฏิเสธที่จะตอบคำถามนี้ (ถูกตัวกรองความปลอดภัยบล็อก) ลองเปลี่ยนคำถามดูนะ"
 
 
+class ModelNotFoundError(AIError):
+    user_message = "🧩 ไม่พบโมเดล AI ที่ตั้งค่าไว้ (อาจถูกถอดแล้ว) แจ้งผู้ดูแลบอทให้เปลี่ยนชื่อโมเดลในไฟล์ .env"
+
+
 class AuthError(AIError):
     user_message = "🔑 API key ไม่ถูกต้องหรือหมดอายุ แจ้งผู้ดูแลบอทให้ตรวจสอบไฟล์ .env"
 
@@ -86,6 +90,12 @@ class AIProvider(ABC):
                 if resp.status in (401, 403):
                     log.error("%s auth error %s: %s", self.name, resp.status, await resp.text())
                     raise AuthError(f"HTTP {resp.status}")
+                if resp.status == 404:
+                    log.error(
+                        "%s HTTP 404 — model %r not found, update *_MODEL in .env: %s",
+                        self.name, self.model, (await resp.text())[:500],
+                    )
+                    raise ModelNotFoundError("HTTP 404")
                 if resp.status >= 400:
                     body = await resp.text()
                     log.error("%s HTTP %s: %s", self.name, resp.status, body[:500])

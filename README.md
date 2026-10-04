@@ -85,7 +85,7 @@ Discord → User Settings → Advanced → เปิด **Developer Mode** → �
 1. เข้า <https://aistudio.google.com/apikey> ล็อกอินด้วยบัญชี Google
 2. กด **Create API key** → คัดลอก key
 3. ใส่ใน `.env`: `AI_PROVIDER=gemini`, `GEMINI_API_KEY=...`
-4. ตรวจชื่อโมเดลล่าสุดที่ <https://ai.google.dev/gemini-api/docs/models> แล้วใส่ใน `GEMINI_MODEL` (เช่น `gemini-2.5-flash`)
+4. ตรวจชื่อโมเดลล่าสุดที่ <https://ai.google.dev/gemini-api/docs/models> แล้วใส่ใน `GEMINI_MODEL` (เช่น `gemini-3.8-flash`)
    - ดูโควต้าฟรีของแต่ละโมเดลได้ที่ <https://ai.google.dev/gemini-api/docs/rate-limits>
    - หมายเหตุ: ข้อมูลที่ส่งผ่าน free tier อาจถูก Google นำไปใช้ปรับปรุงบริการ อย่าให้ผู้ใช้ส่งข้อมูลส่วนตัว/ความลับ
 
@@ -100,7 +100,7 @@ Discord → User Settings → Advanced → เปิด **Developer Mode** → �
 3. เลือกโมเดลฟรีจาก <https://openrouter.ai/models?max_price=0> — **ต้องเป็นชื่อที่ลงท้าย `:free`** เท่านั้น ถึงจะไม่เสียเงิน
    - บัญชีที่ไม่ได้เติมเงิน จะมีโควต้าต่อวันของโมเดล `:free` ค่อนข้างจำกัด
 
-> 💡 **ทำไมชื่อโมเดลอยู่ใน `.env`:** โมเดลฟรีถูกเพิ่ม/ถอดบ่อย ถ้าวันหนึ่งบอทตอบว่า "ระบบ AI มีปัญหา" และ log ขึ้น HTTP 404 แปลว่าโมเดลถูกถอดแล้ว — แค่เปลี่ยนชื่อโมเดลใน `.env` แล้วรีสตาร์ท ไม่ต้องแก้โค้ด
+> 💡 **ทำไมชื่อโมเดลอยู่ใน `.env`:** โมเดลฟรีถูกเพิ่ม/ถอดบ่อย ถ้าวันหนึ่งบอทตอบว่า "🧩 ไม่พบโมเดล AI" และ log ขึ้น HTTP 404 แปลว่าโมเดลถูกถอดแล้ว (ข้อความ error ใน log มักบอกชื่อโมเดลใหม่ที่แนะนำ) — แค่เปลี่ยนชื่อโมเดลใน `.env` แล้วรีสตาร์ท ไม่ต้องแก้โค้ด
 
 ## ขั้นที่ 5: รันบนเครื่อง
 
@@ -135,7 +135,7 @@ python main.py
 
 ```
 [INFO] bot: Synced 2 command(s) to guild 123456789012345678
-[INFO] bot: Logged in as MyBot#1234 (ID ...) | provider=gemini model=gemini-2.5-flash
+[INFO] bot: Logged in as MyBot#1234 (ID ...) | provider=gemini model=gemini-3.8-flash
 ```
 
 ทดลองใน Discord:
@@ -170,7 +170,7 @@ python main.py
 | mention แล้วบอทเงียบ | บอทไม่มีสิทธิ์ View/Send ในช่องนั้น หรือยังไม่เปิด Message Content Intent |
 | บอทตอบ "🔑 API key ไม่ถูกต้อง" | ตรวจ `*_API_KEY` ให้ตรงกับ `AI_PROVIDER` |
 | บอทตอบ "⏳ เกินโควต้าฟรี" | โดน rate limit → รอสักพัก, เพิ่ม `USER_COOLDOWN_SECONDS`, หรือสลับไปเจ้าอื่น |
-| บอทตอบ "⚠️ ระบบ AI มีปัญหา" + log `HTTP 404` | ชื่อโมเดลผิดหรือโมเดลถูกถอด → เปลี่ยน `*_MODEL` |
+| บอทตอบ "🧩 ไม่พบโมเดล AI" + log `HTTP 404` | ชื่อโมเดลผิดหรือโมเดลถูกถอด → เปลี่ยน `*_MODEL` |
 | log ขึ้น `PyNaCl is not installed, voice will NOT be supported` | เป็นแค่คำเตือนเรื่องระบบเสียง บอทนี้ไม่ใช้เสียง ไม่ต้องสนใจ |
 
 > หมายเหตุ: ความจำเก็บในหน่วยความจำ (RAM) — รีสตาร์ทบอทแล้วความจำจะหายหมด
