@@ -146,3 +146,21 @@ def tables_to_lists(text: str) -> str:
         out.append(line)
         i += 1
     return "\n".join(out)
+
+
+# ลิงก์เปล่า ๆ (ไม่อยู่ใน <...> หรือ [ข้อความ](ลิงก์)) — Discord จะแสดงพรีวิวการ์ดใหญ่
+_BARE_URL = re.compile(r"(?<![<(\w])(https?://[^\s<>()\[\]]+[^\s<>()\[\].,!?;:'\"])")
+_MASKED_URL = re.compile(r"\]\((https?://[^\s<>()]+)\)")
+
+
+def suppress_link_previews(text: str) -> str:
+    """ครอบลิงก์เปล่าด้วย <...> เพื่อไม่ให้ Discord แสดงพรีวิวใหญ่ ๆ (ยังกดเปิดได้เหมือนเดิม)"""
+    out: list[str] = []
+    in_code = False
+    for line in text.split("\n"):
+        if line.strip().startswith("```"):
+            in_code = not in_code
+        if not in_code:
+            line = _MASKED_URL.sub(r"](<\1>)", _BARE_URL.sub(r"<\1>", line))
+        out.append(line)
+    return "\n".join(out)
