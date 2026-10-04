@@ -11,6 +11,8 @@ from collections.abc import Awaitable, Callable
 
 import discord
 
+from .utils import tables_to_lists
+
 log = logging.getLogger(__name__)
 
 CURSOR = " ▌"
@@ -40,7 +42,7 @@ class StreamPreview:
             self._task = asyncio.create_task(self._loop())
 
     def _render(self) -> str:
-        body = self._header + self._text
+        body = self._header + tables_to_lists(self._text)
         if len(body) > PREVIEW_LIMIT:
             return body[:PREVIEW_LIMIT] + " …" + CURSOR
         return body + CURSOR

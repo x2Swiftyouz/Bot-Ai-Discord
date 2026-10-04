@@ -41,6 +41,7 @@ class AnswerContext:
     prompt: str = ""
     answer: str = ""
     footer: str = ""  # บรรทัดเล็กใต้คำตอบ (ไม่เก็บลงความจำ)
+    extras: str = ""  # ส่วนเสริมที่บอทต่อท้ายคำตอบ เช่น รายการลิงก์คลิป (ไม่เก็บลงความจำ)
     message_ids: list[int] = field(default_factory=list)
 
 
