@@ -698,7 +698,8 @@ class BackupProvider:
         ready = [p for p in chain if self._paused_until.get(p.name, 0) <= now]
         chain = ready or chain  # ถ้าพักไว้หมดทุกเจ้า ก็ลองทุกเจ้าอยู่ดี
         first_error: AIError | None = None
-        failed: list[str] = []
+        # เจ้าที่ถูกข้ามเพราะพักอยู่ (เกินโควต้า) ก็นับเป็น "ใช้ไม่ได้" ในข้อความแจ้งเตือนด้วย
+        failed: list[str] = [f"{p.name} (พักอยู่ เกินโควต้า)" for p in [self.primary, *self.backups] if p not in chain]
         for i, provider in enumerate(chain):
             last = i == len(chain) - 1
             try:

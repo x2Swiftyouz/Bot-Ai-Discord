@@ -381,11 +381,13 @@ class AIChatBot(discord.Client):
             existing = await preview.finish()
         return existing
 
-    def _render(self, ctx: AnswerContext) -> tuple[list[str], discord.File | None]:
+    def _render(
+        self, ctx: AnswerContext, allow_file: bool = True
+    ) -> tuple[list[str], discord.File | None]:
         """แบ่งคำตอบเป็นข้อความ ถ้ายาวมาก (LONG_ANSWER_FILE_CHARS) แสดงส่วนต้น + แนบฉบับเต็มเป็นไฟล์ .txt"""
         footer = f"\n{ctx.footer}" if ctx.footer else ""
         limit = self.config.long_answer_file_chars
-        if ctx.ok and limit and len(ctx.answer) > limit:
+        if allow_file and ctx.ok and limit and len(ctx.answer) > limit:
             preview = split_message(ctx.answer, LONG_ANSWER_PREVIEW)[0]
             text = (
                 f"{ctx.header}{preview}\n…\n"
@@ -412,22 +414,55 @@ class AIChatBot(discord.Client):
         view = AnswerView(self, ctx) if buttons else None
         chunks, file = self._render(ctx)
         try:
-            for i, chunk in enumerate(chunks):
-                last = i == len(chunks) - 1
-                attach = file if last else None
-                if i == 0 and existing is not None:
-                    extra = {"attachments": [attach]} if attach else {}
-                    await existing.edit(content=chunk, view=view if last else None, **extra)
-                    msg = existing
-                else:
-                    msg = await send(chunk, view if last else None, attach)
-                ctx.message_ids.append(msg.id)
-                if last and view is not None:
-                    view.message = msg
-        except discord.HTTPException:
+            try:
+                await self._send_chunks(ctx, send, existing, view, chunks, file)
+            except discord.Forbidden as e:
+                if file is None:
+                    raise
+                # ไม่มีสิทธิ์ Attach Files → ส่งคำตอบเต็มแบบแบ่งหลายข้อความแทน
+                log.warning("แนบไฟล์คำตอบไม่ได้ (ขาดสิทธิ์ Attach Files?) ส่งแบบแบ่งข้อความแทน: %r", e)
+                self.admin_log.post(
+                    "📄 แนบไฟล์คำตอบยาวไม่ได้ (บอทขาดสิทธิ์ **Attach Files**) — ส่งแบบแบ่งหลายข้อความแทน",
+                    key="attach_forbidden",
+                )
+                chunks, _ = self._render(ctx, allow_file=False)
+                await self._send_chunks(ctx, send, existing, view, chunks, None)
+        except discord.HTTPException as e:
             log.exception("Failed to send answer")
             if view is not None:
                 view.stop()
+            # อย่าให้ผู้ใช้รอเงียบ ๆ: แจ้งในห้อง + ส่งรายละเอียดเข้าห้อง log
+            self.admin_log.post(
+                f"❌ ส่งคำตอบเข้า Discord ไม่สำเร็จ: `{e!r}`"[:500],
+                key=f"deliver:{type(e).__name__}:{e.status}",
+            )
+            try:
+                await send("⚠️ AI ตอบแล้วแต่ส่งคำตอบไม่สำเร็จ ลองกด 🔄 หรือถามใหม่อีกครั้งนะ", None)
+            except discord.HTTPException:
+                pass
+
+    async def _send_chunks(
+        self,
+        ctx: AnswerContext,
+        send: Sender,
+        existing: discord.Message | discord.WebhookMessage | None,
+        view: AnswerView | None,
+        chunks: list[str],
+        file: discord.File | None,
+    ) -> None:
+        ctx.message_ids = []
+        for i, chunk in enumerate(chunks):
+            last = i == len(chunks) - 1
+            attach = file if last else None
+            if i == 0 and existing is not None:
+                extra = {"attachments": [attach]} if attach else {}
+                await existing.edit(content=chunk, view=view if last else None, **extra)
+                msg = existing
+            else:
+                msg = await send(chunk, view if last else None, attach)
+            ctx.message_ids.append(msg.id)
+            if last and view is not None:
+                view.message = msg
 
     def _channel_sender(
         self, channel: discord.abc.Messageable, reply_to: discord.Message | None = None
