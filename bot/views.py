@@ -33,6 +33,7 @@ class AnswerContext:
     guild_id: int | None = None
     exempt: bool = False  # แอดมิน ไม่ถูกจำกัดโควต้ารายวัน
     search_query: str = ""  # ข้อความที่ผู้ใช้พิมพ์จริง ใช้ตัดสินใจ/ค้นเว็บ (ว่าง = ไม่ค้น)
+    use_memory: bool = True  # False = คำถามเดี่ยว ไม่อ่าน/ไม่บันทึกความจำของช่อง (เช่น เมนูคลิกขวา)
     ok: bool = False
     prompt: str = ""
     answer: str = ""
