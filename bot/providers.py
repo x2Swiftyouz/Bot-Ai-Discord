@@ -44,6 +44,14 @@ CURRENT_PERSONA: ContextVar[str | None] = ContextVar("CURRENT_PERSONA", default=
 # ข้อมูลที่ผู้ถามขอให้จำไว้ (/remember) — ต่อท้าย system prompt ของคำถามนั้น
 CURRENT_USER_NOTES: ContextVar[str | None] = ContextVar("CURRENT_USER_NOTES", default=None)
 
+# บอก AI ว่าบอทจัดการข้อความยาวให้เอง — ไม่งั้น AI มักปฏิเสธงานยาวเพราะคิดว่าติดข้อจำกัด 2,000 ตัวอักษรของ Discord
+PLATFORM_NOTE = (
+    "หมายเหตุระบบ: คุณกำลังตอบในแชต Discord ผ่านบอทที่แบ่งข้อความยาวเป็นหลายข้อความ "
+    "หรือแนบเป็นไฟล์ .txt ให้อัตโนมัติ จึงไม่ต้องกังวลเรื่องข้อจำกัดความยาวของ Discord "
+    "ถ้าผู้ใช้ขอเนื้อหายาว (เช่น บทความหลายพันคำ) ให้เขียนเต็มความยาวที่ขอได้เลยในคำตอบเดียว "
+    "ไม่ต้องเสนอแบ่งส่วนหรือส่งไฟล์ Word/Google Docs เพราะคุณทำสิ่งนั้นไม่ได้"
+)
+
 # รับ "ข้อความทั้งหมดที่ได้มาถึงตอนนี้" ระหว่าง streaming (ใช้แสดงคำตอบค่อย ๆ พิมพ์)
 OnDelta = Callable[[str], None]
 
@@ -269,7 +277,7 @@ class AIProvider(ABC):
         """system prompt + วันเวลาปัจจุบัน (AI ไม่รู้วันที่เองจึงคำนวณระยะเวลาผิดถ้าไม่บอก)"""
         now = f"ข้อมูลอ้างอิง: ตอนนี้คือ{now_text(self.timezone)} ใช้ข้อมูลนี้เมื่อต้องคำนวณวันเวลา"
         base = CURRENT_PERSONA.get() or self.system_prompt
-        parts = [p for p in (base, now, CURRENT_USER_NOTES.get()) if p]
+        parts = [p for p in (base, now, PLATFORM_NOTE, CURRENT_USER_NOTES.get()) if p]
         return "\n\n".join(parts)
 
     async def generate(
