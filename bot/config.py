@@ -43,6 +43,8 @@ class Config:
     provider: str
     api_key: str
     model: str
+    fallback_models: tuple[str, ...]
+    max_retries: int
     system_prompt: str
     memory_size: int
     user_cooldown: float
@@ -69,6 +71,10 @@ class Config:
         if not model:
             raise ConfigError(f"ไม่พบ {prefix}_MODEL ใน .env")
 
+        fallback_models = tuple(
+            m.strip() for m in os.getenv(f"{prefix}_FALLBACK_MODELS", "").split(",") if m.strip()
+        )
+
         guild_raw = os.getenv("GUILD_ID", "").strip()
         guild_id = _get_int("GUILD_ID", 0) if guild_raw else None
 
@@ -78,6 +84,8 @@ class Config:
             provider=provider,
             api_key=api_key,
             model=model,
+            fallback_models=fallback_models,
+            max_retries=min(5, max(0, _get_int("AI_MAX_RETRIES", 2))),
             system_prompt=os.getenv(
                 "SYSTEM_PROMPT", "You are a helpful assistant on Discord."
             ).strip(),
