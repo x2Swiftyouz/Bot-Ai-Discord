@@ -98,6 +98,8 @@ def _unclosed_fence(chunk: str) -> str | None:
 
 # ---------- ตาราง Markdown → รายการ (Discord แสดงตารางไม่ได้) ----------
 
+# <br> ของ HTML ที่ AI ชอบใส่ในตาราง — Discord แสดงเป็นตัวอักษรตรง ๆ
+_HTML_BREAK = re.compile(r"<br\s*/?>", re.IGNORECASE)
 _TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$")
 
 
@@ -131,7 +133,8 @@ def tables_to_lists(text: str) -> str:
             headers = _cells(line)
             i += 2
             while i < len(lines) and lines[i].strip() and _is_table_row(lines[i]):
-                row = _cells(lines[i])
+                # <br> ในช่องตาราง → ขึ้นบรรทัดใหม่แบบย่อหน้าต่อจาก bullet
+                row = [_HTML_BREAK.sub("\n  ", c).strip() for c in _cells(lines[i])]
                 first = row[0] if row else ""
                 if first and not first.startswith("**"):
                     first = f"**{first}**"
@@ -143,7 +146,7 @@ def tables_to_lists(text: str) -> str:
                 out.append(f"- {first} — {' · '.join(rest)}" if rest else f"- {first}")
                 i += 1
             continue
-        out.append(line)
+        out.append(line if in_code else _HTML_BREAK.sub("\n", line))
         i += 1
     return "\n".join(out)
 
