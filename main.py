@@ -13,19 +13,22 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta
+from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
 from discord.ext import tasks
 
+from bot import persona
+from bot.adminlog import AdminLog
 from bot.channels import AIChannelStore
 from bot.config import Config, ConfigError
 from bot.cooldown import UserCooldown
 from bot.media import is_image, read_images
 from bot.memory import ChannelMemory
 from bot.providers import (
-    AIError, AIProvider, BackupProvider, ImageData, OnDelta, create_provider,
+    CURRENT_PERSONA, AIError, AIProvider, BackupProvider, ImageData, OnDelta, create_provider,
 )
 from bot.search import SearchError, TavilySearch, format_results, should_search
 from bot.storage import Database
@@ -103,11 +106,15 @@ class AIChatBot(discord.Client):
         self.db = Database(config.data_dir / "bot.db")
         self.memory = ChannelMemory(config.memory_size, self.db if config.memory_persist else None)
         self.search = TavilySearch(config.tavily_api_key) if config.tavily_api_key else None
+        self.admin_log = AdminLog(self, config.log_channel_id)
         self.cooldown = UserCooldown(config.user_cooldown)
         self.ai_channels = AIChannelStore(
             config.ai_channel_ids, config.data_dir / "ai_channels.json"
         )
         self.ai: AIProvider | BackupProvider = create_provider(config)
+        if isinstance(self.ai, BackupProvider):
+            # แจ้งเข้าห้อง log เมื่อสลับไปตัวสำรอง / AI ใช้ไม่ได้ทุกตัว
+            self.ai.on_event = lambda key, message: self.admin_log.post(message, key=key)
         self.answer_count = 0
         self._cleaned_commands = False
         self._statuses = itertools.cycle(self._status_texts())
@@ -125,18 +132,40 @@ class AIChatBot(discord.Client):
             synced = await self.tree.sync()
             log.info("Synced %d global command(s) (อาจใช้เวลาสักพักกว่าจะขึ้น)", len(synced))
         self.rotate_status.start()
+        self.daily_summary.change_interval(time=dtime(0, 0, tzinfo=ZoneInfo(self.config.timezone)))
+        self.daily_summary.start()
 
     async def on_ready(self) -> None:
         log.info(
             "Logged in as %s (ID %s) | provider=%s model=%s backup=%s",
             self.user, self.user.id if self.user else "?", self.config.provider, self.config.model,
-            f"{self.config.backup_provider}/{self.config.backup_model}"
-            if self.config.backup_provider else "-",
+            self.config.backup_summary,
         )
         if not self._cleaned_commands:
             self._cleaned_commands = True
             await self._remove_stale_commands()
-            await self.ai.check_models()
+            problems = await self.ai.check_models()
+            search = "Tavily" if self.config.tavily_api_key else "ปิด"
+            self.admin_log.post(
+                f"✅ **บอทออนไลน์แล้ว** · AI: `{self.config.provider}/{self.config.model}` · "
+                f"สำรอง: `{self.config.backup_summary}` · ค้นเว็บ: {search}"
+            )
+            for problem in problems:
+                self.admin_log.post(problem)
+
+    @tasks.loop(hours=24)
+    async def daily_summary(self) -> None:
+        """เที่ยงคืน (ตาม TIMEZONE): ส่งสรุปสถิติของเมื่อวานเข้าห้อง log"""
+        yesterday = (
+            datetime.now(ZoneInfo(self.config.timezone)) - timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+        channel = self.get_channel(self.admin_log.channel_id or 0)
+        guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        self.admin_log.post(embed=self._stats_embed(guild_id, day=yesterday))
+
+    @daily_summary.before_loop
+    async def _before_daily_summary(self) -> None:
+        await self.wait_until_ready()
 
     async def _remove_stale_commands(self) -> None:
         """ลบคำสั่ง slash ที่ค้างอยู่ใน Discord แต่ไม่ได้มาจากโค้ดนี้
@@ -207,6 +236,21 @@ class AIChatBot(discord.Client):
         # ความจำเก็บแค่คำถาม ไม่เก็บรูปหรือผลค้นเว็บ (ประหยัดโควต้า) จึงจดไว้ว่ามีรูปแนบ
         ctx.prompt = prompt + (f" [แนบรูป {len(ctx.images)} รูป]" if ctx.images else "")
         ctx.footer = ""
+        # บุคลิกของห้อง (/persona) — ใช้แทน SYSTEM_PROMPT ระหว่างคำถามนี้
+        persona_token = CURRENT_PERSONA.set(self._persona_prompt(ctx) if ctx.use_memory else None)
+        try:
+            await self._ask_ai(ctx, prompt, on_delta)
+        finally:
+            CURRENT_PERSONA.reset(persona_token)
+
+    def _persona_prompt(self, ctx: AnswerContext) -> str | None:
+        """บุคลิกของห้องนี้ (เธรดใช้บุคลิกของห้องแม่ถ้าตัวเองไม่ได้ตั้ง)"""
+        for channel_id in (ctx.channel_id, getattr(ctx.channel, "parent_id", None)):
+            if channel_id and (found := persona.resolve(self.db.get_setting(persona.key_for(channel_id)))):
+                return found[1]
+        return None
+
+    async def _ask_ai(self, ctx: AnswerContext, prompt: str, on_delta: OnDelta | None) -> None:
         async with self.memory.lock(ctx.channel_id):
             history = self.memory.get(ctx.channel_id) if ctx.use_memory else []
             started = time.monotonic()
@@ -216,6 +260,7 @@ class AIChatBot(discord.Client):
                     found = await self.search.search(ctx.search_query)
                 except SearchError as e:
                     log.warning("ค้นเว็บไม่สำเร็จ ตอบแบบไม่ค้นเว็บแทน: %s", e)
+                    self.admin_log.post(f"🔎 ค้นเว็บ (Tavily) ไม่สำเร็จ: `{e}`", key="tavily")
                     found = []
                 if found:
                     prompt += "\n\n" + format_results(found, now_text(self.config.timezone))
@@ -225,8 +270,9 @@ class AIChatBot(discord.Client):
             except AIError as e:
                 log.warning("AI error in channel %s: %r", ctx.channel_id, e)
                 ctx.ok, ctx.answer = False, e.user_message
-            except Exception:
+            except Exception as e:
                 log.exception("Unexpected error while calling AI")
+                self.admin_log.post(f"❌ error ไม่คาดคิด: `{e!r}`"[:500], key=f"unexpected:{type(e).__name__}")
                 ctx.ok, ctx.answer = False, "⚠️ เกิดข้อผิดพลาดที่ไม่คาดคิด ลองใหม่อีกครั้งนะ"
             else:
                 if sources:
@@ -438,6 +484,10 @@ class AIChatBot(discord.Client):
         limit = self.config.daily_limit
         if limit and not self._is_exempt(user):
             if self.db.used_today(self._today(), user.id) >= limit:
+                self.admin_log.post(
+                    f"📊 **{user.display_name}** ใช้ครบโควต้า {limit} คำถามของวันนี้แล้ว",
+                    key=f"quota:{self._today()}:{user.id}", cooldown=86400,
+                )
                 return f"📊 วันนี้คุณถามครบ {limit} คำถามแล้ว โควต้าจะรีเซ็ตตอนเที่ยงคืน แล้วเจอกันพรุ่งนี้นะ 🙏"
         return self._cooldown_message(user.id)
 
@@ -735,6 +785,94 @@ class AIChatBot(discord.Client):
         async def explain_menu(interaction: discord.Interaction, message: discord.Message) -> None:
             await self.message_action(interaction, message, "explain")
 
+        @self.tree.command(name="logchannel", description="ตั้งห้องนี้เป็นห้อง log ของแอดมิน (แจ้งปัญหาของบอท + สรุปรายวัน)")
+        @app_commands.describe(mode="ตั้ง / ปิด / ทดสอบ")
+        @app_commands.choices(
+            mode=[
+                app_commands.Choice(name="ตั้งห้องนี้เป็นห้อง log", value="set"),
+                app_commands.Choice(name="ปิดห้อง log", value="off"),
+                app_commands.Choice(name="ทดสอบส่งข้อความ + สรุปสถิติวันนี้", value="test"),
+            ]
+        )
+        @app_commands.guild_only()
+        @app_commands.default_permissions(manage_guild=True)
+        async def logchannel(
+            interaction: discord.Interaction, mode: app_commands.Choice[str]
+        ) -> None:
+            if mode.value == "set":
+                self.admin_log.set_channel(interaction.channel_id)
+                await interaction.response.send_message(
+                    "📋 ตั้งห้องนี้เป็น **ห้อง log** แล้ว บอทจะแจ้งที่นี่เมื่อ:\n"
+                    "• สลับไปใช้ AI สำรอง / AI ใช้ไม่ได้ทุกตัว\n"
+                    "• โมเดลใน .env ถูกถอด (ตอนเริ่มบอท) · ค้นเว็บไม่สำเร็จ · มีคนใช้ครบโควต้า\n"
+                    "• 🌙 สรุปสถิติทุกเที่ยงคืน"
+                )
+            elif mode.value == "off":
+                self.admin_log.set_channel(None)
+                await interaction.response.send_message("⏹️ ปิดห้อง log แล้ว", ephemeral=True)
+            else:
+                if self.admin_log.channel_id is None:
+                    await interaction.response.send_message(
+                        "ยังไม่ได้ตั้งห้อง log — ใช้ `/logchannel ตั้งห้องนี้เป็นห้อง log` ก่อน", ephemeral=True
+                    )
+                    return
+                await interaction.response.send_message(
+                    f"ส่งข้อความทดสอบไปที่ <#{self.admin_log.channel_id}> แล้ว", ephemeral=True
+                )
+                self.admin_log.post("🧪 ทดสอบห้อง log: ใช้งานได้ ✅")
+                self.admin_log.post(embed=self._stats_embed(interaction.guild_id))
+
+        persona_choices = [
+            app_commands.Choice(name="ดูบุคลิกปัจจุบันของห้องนี้", value="view"),
+            app_commands.Choice(name="ค่าเริ่มต้น (ตาม SYSTEM_PROMPT)", value="default"),
+            *[app_commands.Choice(name=label, value=key) for key, (label, _) in persona.PRESETS.items()],
+            app_commands.Choice(name="✏️ กำหนดเอง (พิมพ์ในช่อง text)", value="custom"),
+        ]
+
+        @self.tree.command(name="persona", description="ตั้งบุคลิกของบอทในห้องนี้")
+        @app_commands.describe(mode="เลือกบุคลิก", text="บุคลิกที่กำหนดเอง (ใช้กับ ✏️ กำหนดเอง)")
+        @app_commands.choices(mode=persona_choices)
+        @app_commands.guild_only()
+        @app_commands.default_permissions(manage_channels=True)
+        async def persona_cmd(
+            interaction: discord.Interaction,
+            mode: app_commands.Choice[str],
+            text: str | None = None,
+        ) -> None:
+            channel_id = interaction.channel_id or 0
+            key = persona.key_for(channel_id)
+            if mode.value == "view":
+                saved = self.db.get_setting(key) or ""
+                current = persona.resolve(saved)
+                if current is None:
+                    msg = "🎭 ห้องนี้ใช้บุคลิก **ค่าเริ่มต้น** (ตาม SYSTEM_PROMPT)"
+                else:
+                    msg = f"🎭 บุคลิกของห้องนี้: **{current[0]}**"
+                    if saved.startswith("custom:"):
+                        msg += f"\n> {saved.removeprefix('custom:')[:300]}"
+                await interaction.response.send_message(msg, ephemeral=True)
+                return
+            if mode.value == "default":
+                self.db.delete_setting(key)
+                label = "ค่าเริ่มต้น"
+            elif mode.value == "custom":
+                if not text or not text.strip():
+                    await interaction.response.send_message(
+                        "พิมพ์บุคลิกที่ต้องการในช่อง `text` ด้วยนะ เช่น "
+                        "`พูดเหมือนโจรสลัด ชอบเล่าเรื่องผจญภัย`",
+                        ephemeral=True,
+                    )
+                    return
+                self.db.set_setting(key, "custom:" + text.strip()[: persona.CUSTOM_MAX])
+                label = "✏️ กำหนดเอง"
+            else:
+                self.db.set_setting(key, mode.value)
+                label = persona.PRESETS[mode.value][0]
+            await interaction.response.send_message(
+                f"🎭 เปลี่ยนบุคลิกของบอทในห้องนี้เป็น **{label}** แล้ว\n"
+                "-# ถ้าบอทยังพูดสไตล์เดิม ให้ใช้ `/reset` ล้างความจำของห้องก่อน"
+            )
+
         @self.tree.command(name="usage", description="ดูว่าวันนี้ถาม AI ไปแล้วกี่ครั้ง")
         async def usage(interaction: discord.Interaction) -> None:
             used = self.db.used_today(self._today(), interaction.user.id)
@@ -775,10 +913,11 @@ class AIChatBot(discord.Client):
                 pass
 
 
-    def _stats_embed(self, guild_id: int | None) -> discord.Embed:
-        today = self._today()
+    def _stats_embed(self, guild_id: int | None, day: str | None = None) -> discord.Embed:
+        today = day or self._today()
         s = self.db.day_stats(today, guild_id)
-        embed = discord.Embed(title="📈 สถิติบอท AI วันนี้", color=BRAND_COLOR)
+        title = "📈 สถิติบอท AI วันนี้" if day is None else f"🌙 สรุปสถิติบอท AI ประจำวันที่ {today}"
+        embed = discord.Embed(title=title, color=BRAND_COLOR)
         embed.add_field(name="💬 คำตอบ", value=f"**{s.answers:,}**", inline=True)
         embed.add_field(name="👥 ผู้ใช้", value=f"**{s.users:,}** คน", inline=True)
         embed.add_field(name="⚡ เวลาเฉลี่ย", value=f"**{s.avg_elapsed:.1f}** วิ", inline=True)
@@ -789,7 +928,7 @@ class AIChatBot(discord.Client):
         top = self.db.top_users(today, guild_id)
         medals = ["🥇", "🥈", "🥉", "4.", "5."]
         embed.add_field(
-            name="🏆 ถามมากที่สุดวันนี้",
+            name="🏆 ถามมากที่สุด",
             value="\n".join(f"{medals[i]} {name} — {n}" for i, (name, n) in enumerate(top))
             or "ยังไม่มี",
             inline=False,
@@ -801,8 +940,8 @@ class AIChatBot(discord.Client):
             inline=False,
         )
         # กราฟแท่งเล็ก ๆ ของ 7 วันล่าสุด
-        now = datetime.now(ZoneInfo(self.config.timezone))
-        days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
+        end = datetime.strptime(today, "%Y-%m-%d")
+        days = [(end - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
         totals = self.db.daily_totals(days, guild_id)
         peak = max((n for _, n in totals), default=0) or 1
         bars = "▁▂▃▄▅▆▇█"

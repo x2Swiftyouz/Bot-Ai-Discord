@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import time
 from abc import ABC, abstractmethod
-import json
 from collections.abc import AsyncIterator, Callable, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 
 import aiohttp
@@ -37,6 +38,9 @@ class ImageData:
     def b64(self) -> str:
         return base64.b64encode(self.data).decode("ascii")
 
+
+# บุคลิกของห้องที่กำลังตอบ (/persona) — ตั้งโดยบอทก่อนเรียก AI แทนที่ SYSTEM_PROMPT
+CURRENT_PERSONA: ContextVar[str | None] = ContextVar("CURRENT_PERSONA", default=None)
 
 # รับ "ข้อความทั้งหมดที่ได้มาถึงตอนนี้" ระหว่าง streaming (ใช้แสดงคำตอบค่อย ๆ พิมพ์)
 OnDelta = Callable[[str], None]
@@ -108,6 +112,8 @@ class AIProvider(ABC):
         self.model = config.model
         # ลองโมเดลหลักก่อน ถ้าล่ม/เกินโควต้า/ถูกถอด ค่อยไล่ลองโมเดลสำรองตามลำดับ
         self.models = list(dict.fromkeys((config.model, *config.fallback_models)))
+        # โมเดลที่ใช้เมื่อคำถามมีรูป (ว่าง = ใช้โมเดลปกติ)
+        self.vision_model = config.vision_model
         self.max_retries = config.max_retries
         self.system_prompt = config.system_prompt
         self.timezone = config.timezone
@@ -198,26 +204,34 @@ class AIProvider(ABC):
         """เลือกชื่อโมเดลตัวอย่างไว้แสดงใน log"""
         return sorted(available)[:10]
 
-    async def check_models(self) -> None:
-        """ตอนเริ่มบอท: เช็กว่าชื่อโมเดลใน .env ยังมีอยู่จริง (โมเดลฟรีถูกถอดบ่อย) แล้วเตือนใน log"""
+    async def check_models(self) -> list[str]:
+        """ตอนเริ่มบอท: เช็กว่าชื่อโมเดลใน .env ยังมีอยู่จริง (โมเดลฟรีถูกถอดบ่อย)
+
+        เตือนใน log และคืนรายการปัญหาที่เจอ (ไว้ส่งเข้าห้อง log ของแอดมิน)
+        """
         try:
             available = await self.available_models()
         except AIError as e:
             log.warning("เช็กรายชื่อโมเดลของ %s ไม่ได้ (%r) ข้ามการตรวจ", self.name, e)
-            return
+            return []
         if not available:
-            return
-        missing = [m for m in self.models if m not in available]
+            return []
+        configured = list(dict.fromkeys((*self.models, *([self.vision_model] if self.vision_model else []))))
+        missing = [m for m in configured if m not in available]
         if not missing:
-            log.info("ตรวจโมเดล %s: %s ใช้ได้ ✅", self.name, ", ".join(self.models))
-            return
+            log.info("ตรวจโมเดล %s: %s ใช้ได้ ✅", self.name, ", ".join(configured))
+            return []
         prefix = self.name.upper()
+        problems = []
         for model in missing:
-            log.error(
-                "⚠️ %s ไม่มีโมเดล %r แล้ว (ถูกถอดหรือพิมพ์ผิด) — แก้ %s_MODEL / %s_FALLBACK_MODELS "
-                "ใน .env | ตัวอย่างโมเดลที่ใช้ได้ตอนนี้: %s",
-                self.name, model, prefix, prefix, ", ".join(self.suggest(available)),
+            message = (
+                f"⚠️ {self.name} ไม่มีโมเดล {model!r} แล้ว (ถูกถอดหรือพิมพ์ผิด) — แก้ "
+                f"{prefix}_MODEL / {prefix}_FALLBACK_MODELS / {prefix}_VISION_MODEL ใน .env | "
+                f"ตัวอย่างโมเดลที่ใช้ได้ตอนนี้: {', '.join(self.suggest(available))}"
             )
+            log.error("%s", message)
+            problems.append(message)
+        return problems
 
     async def _raise_for_status(self, resp: aiohttp.ClientResponse, model: str) -> None:
         """แปลง HTTP error เป็น exception ที่บอทเข้าใจ (ไม่ทำอะไรถ้าสำเร็จ)"""
@@ -252,7 +266,8 @@ class AIProvider(ABC):
     def build_system_prompt(self) -> str:
         """system prompt + วันเวลาปัจจุบัน (AI ไม่รู้วันที่เองจึงคำนวณระยะเวลาผิดถ้าไม่บอก)"""
         now = f"ข้อมูลอ้างอิง: ตอนนี้คือ{now_text(self.timezone)} ใช้ข้อมูลนี้เมื่อต้องคำนวณวันเวลา"
-        return f"{self.system_prompt}\n\n{now}" if self.system_prompt else now
+        base = CURRENT_PERSONA.get() or self.system_prompt
+        return f"{base}\n\n{now}" if base else now
 
     async def generate(
         self,
@@ -273,7 +288,10 @@ class AIProvider(ABC):
         ถ้าทุกโมเดลล้มเหลว จะ raise error ล่าสุดเพื่อให้บอทแจ้งผู้ใช้
         """
         last_error: AIError | None = None
-        for model in self.models:
+        models = self.models
+        if images and self.vision_model:
+            models = list(dict.fromkeys((self.vision_model, *self.models)))
+        for model in models:
             now = time.monotonic()
             keys = [
                 (no, key) for no, key in enumerate(self.api_keys)
@@ -302,7 +320,7 @@ class AIProvider(ABC):
                     # ปัญหาที่ตัวโมเดล ไม่เกี่ยวกับ key → ข้ามไปโมเดลถัดไป
                     last_error = e
                     break
-            if model != self.models[-1]:
+            if model != models[-1]:
                 log.warning("%s model %s failed (%r), trying fallback", self.name, model, last_error)
         assert last_error is not None
         raise last_error
@@ -608,20 +626,49 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         return {"X-Title": "Discord AI Bot"}
 
 
-class BackupProvider:
-    """ใช้ตัวหลักก่อน ถ้าเกินโควต้า/ล่ม/ช้า/error ค่อยใช้ตัวสำรอง
+_ERROR_REASONS: list[tuple[type[AIError], str]] = [
+    (RateLimitError, "เกินโควต้า 429"),
+    (ServiceUnavailableError, "เซิร์ฟเวอร์ล่ม 5xx"),
+    (AITimeoutError, "ตอบช้าเกินไป"),
+    (ModelNotFoundError, "ไม่พบโมเดล 404"),
+    (AuthError, "API key ใช้ไม่ได้"),
+    (BadRequestError, "คำขอไม่ถูกต้อง 400 (เช่น โมเดลอ่านรูปไม่ได้)"),
+]
 
-    ถ้าตัวหลักโดน 429 จะพักตัวหลักไว้ชั่วครู่ แล้วส่งไปตัวสำรองตรง ๆ (ไม่ต้องรอตัวหลักตอบ error ทุกครั้ง)
+
+def error_reason(error: AIError) -> str:
+    return next((text for cls, text in _ERROR_REASONS if isinstance(error, cls)), "error")
+
+
+# แจ้งเหตุการณ์สำคัญออกไปข้างนอก (เช่น ห้อง log ของแอดมิน): (key สำหรับกันแจ้งซ้ำ, ข้อความ)
+EventHook = Callable[[str, str], None]
+
+
+class BackupProvider:
+    """ใช้ตัวหลักก่อน ถ้าเกินโควต้า/ล่ม/ช้า/error ค่อยไล่ลองตัวสำรองตามลำดับ
+
+    - เจ้าที่โดน 429 จะถูกพักไว้ชั่วครู่ คำถามช่วงนั้นข้ามไปเจ้าถัดไปเลย (ไม่ต้องรอ error ทุกครั้ง)
+    - ข้อความธรรมดา: ไม่ลองซ้ำเมื่อเซิร์ฟเวอร์ล่ม เพราะมีเจ้าถัดไปตอบแทนได้ทันที
+    - ข้อความที่มีรูป: ลองซ้ำก่อน และถ้าเจ้าไหนอ่านรูปไม่ได้ (400) ก็ไปเจ้าถัดไป
     """
 
     # ไม่ใช้ตัวสำรองเมื่อคำถามถูกตัวกรองความปลอดภัยบล็อก
     NO_BACKUP_ERRORS = (AIBlockedError,)
     MIN_PAUSE_SECONDS = 60
 
-    def __init__(self, primary: AIProvider, backup: AIProvider) -> None:
+    def __init__(self, primary: AIProvider, backups: Sequence[AIProvider]) -> None:
         self.primary = primary
-        self.backup = backup
-        self._primary_paused_until = 0.0
+        self.backups = list(backups)
+        self._paused_until: dict[str, float] = {}
+        self.on_event: EventHook | None = None
+
+    @property
+    def backup(self) -> AIProvider:
+        return self.backups[0]
+
+    def _emit(self, key: str, message: str) -> None:
+        if self.on_event is not None:
+            self.on_event(key, message)
 
     async def generate(
         self,
@@ -631,40 +678,55 @@ class BackupProvider:
         on_delta: OnDelta | None = None,
         retry: bool = True,
     ) -> AIResult:
-        primary_error: AIError | None = None
-        if time.monotonic() >= self._primary_paused_until:
+        chain = [self.primary, *self.backups]
+        now = time.monotonic()
+        ready = [p for p in chain if self._paused_until.get(p.name, 0) <= now]
+        chain = ready or chain  # ถ้าพักไว้หมดทุกเจ้า ก็ลองทุกเจ้าอยู่ดี
+        first_error: AIError | None = None
+        failed: list[str] = []
+        for i, provider in enumerate(chain):
+            last = i == len(chain) - 1
             try:
-                # สลับแบบฉลาด: ข้อความธรรมดา → ตัวหลักล่มแล้วไปตัวสำรองทันที (ไม่ต้องรอลองซ้ำ)
-                # มีรูป → ลองตัวหลักซ้ำก่อน เพราะตัวสำรองอาจอ่านรูปไม่ได้
-                return await self.primary.generate(
-                    history, prompt, images, on_delta, retry=retry and bool(images)
+                result = await provider.generate(
+                    history, prompt, images, on_delta, retry=retry and (last or bool(images))
                 )
             except self.NO_BACKUP_ERRORS:
                 raise
             except AIError as e:
-                primary_error = e
+                first_error = first_error or e
+                failed.append(f"{provider.name} ({error_reason(e)})")
                 if isinstance(e, RateLimitError):
                     pause = max(e.retry_after or 0, self.MIN_PAUSE_SECONDS)
-                    self._primary_paused_until = time.monotonic() + pause
-                    log.warning("พัก %s %.0f วินาที (เกินโควต้า) ใช้ %s แทน",
-                                self.primary.name, pause, self.backup.name)
+                    self._paused_until[provider.name] = time.monotonic() + pause
+                    log.warning("พัก %s %.0f วินาที (เกินโควต้า)", provider.name, pause)
                 else:
-                    log.warning("%s ใช้ไม่ได้ (%r) ใช้ %s แทน", self.primary.name, e, self.backup.name)
-        try:
-            result = await self.backup.generate(history, prompt, images, on_delta, retry)
-        except AIError as e:
-            log.warning("ตัวสำรอง %s ก็ใช้ไม่ได้: %r", self.backup.name, e)
-            # แจ้งผู้ใช้ด้วย error ของตัวหลัก (สาเหตุแรก) ถ้ามี
-            raise primary_error or e from e
-        return AIResult(result.text, result.model, result.sources, result.searched, backup=True)
+                    log.warning("%s ใช้ไม่ได้: %r", provider.name, e)
+                continue
+            if provider is self.primary:
+                return result
+            self._emit(
+                f"fallback:{','.join(failed)}->{provider.name}",
+                f"🛟 {' → '.join(failed)} ใช้ไม่ได้ → ตอบด้วย **{provider.name}** (`{result.model}`) แทน",
+            )
+            return replace(result, backup=True)
+        self._emit(
+            f"allfail:{','.join(failed)}",
+            f"🔥 AI ทุกตัวใช้ไม่ได้: {' · '.join(failed)} — ผู้ใช้จะเห็นข้อความ error",
+        )
+        assert first_error is not None
+        # แจ้งผู้ใช้ด้วย error ของเจ้าแรกที่ลอง (สาเหตุแรก)
+        raise first_error
 
-    async def check_models(self) -> None:
-        await self.primary.check_models()
-        await self.backup.check_models()
+    async def check_models(self) -> list[str]:
+        problems = await self.primary.check_models()
+        for backup in self.backups:
+            problems += await backup.check_models()
+        return problems
 
     async def close(self) -> None:
         await self.primary.close()
-        await self.backup.close()
+        for backup in self.backups:
+            await backup.close()
 
 
 _PROVIDERS: dict[str, type[AIProvider]] = {
@@ -676,13 +738,19 @@ _PROVIDERS: dict[str, type[AIProvider]] = {
 
 def create_provider(config: Config) -> AIProvider | BackupProvider:
     primary = _PROVIDERS[config.provider](config)
-    if not config.backup_provider:
+    if not config.backups:
         return primary
-    backup_config = replace(
-        config,
-        provider=config.backup_provider,
-        api_keys=config.backup_api_keys,
-        model=config.backup_model,
-        fallback_models=config.backup_fallback_models,
-    )
-    return BackupProvider(primary, _PROVIDERS[config.backup_provider](backup_config))
+    backups = [
+        _PROVIDERS[b.provider](
+            replace(
+                config,
+                provider=b.provider,
+                api_keys=b.api_keys,
+                model=b.model,
+                fallback_models=b.fallback_models,
+                vision_model=b.vision_model,
+            )
+        )
+        for b in config.backups
+    ]
+    return BackupProvider(primary, backups)

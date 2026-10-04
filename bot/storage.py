@@ -38,6 +38,11 @@ CREATE TABLE IF NOT EXISTS usage (
     elapsed   REAL
 );
 CREATE INDEX IF NOT EXISTS idx_usage_day_user ON usage (day, user_id);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -63,6 +68,24 @@ class Database:
 
     def close(self) -> None:
         self.conn.close()
+
+    # ---------- settings (ค่าที่ตั้งผ่านคำสั่งใน Discord เช่น ห้อง log, บุคลิกของห้อง) ----------
+
+    def get_setting(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        self.conn.commit()
+
+    def delete_setting(self, key: str) -> None:
+        self.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        self.conn.commit()
 
     # ---------- usage ----------
 

@@ -24,10 +24,21 @@ def _split(value: str) -> list[str]:
     return [x.strip() for x in value.split(",") if x.strip()]
 
 
+@dataclass(frozen=True)
+class ProviderSettings:
+    """ค่าตั้งค่าของผู้ให้บริการ AI หนึ่งเจ้า (ใช้กับตัวสำรอง)"""
+
+    provider: str
+    api_keys: tuple[str, ...]
+    model: str
+    fallback_models: tuple[str, ...]
+    vision_model: str
+
+
 def _provider_settings(
     provider: str, var: str, warnings: list[str]
-) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
-    """อ่าน (API key ทั้งหมด, โมเดล, โมเดลสำรอง) ของผู้ให้บริการ AI จาก .env
+) -> ProviderSettings:
+    """อ่าน API key ทั้งหมด, โมเดล, โมเดลสำรอง, โมเดลอ่านรูป ของผู้ให้บริการ AI จาก .env
 
     key หลายตัว: ใส่ใน <PREFIX>_API_KEYS คั่นด้วยจุลภาค (ใช้ตัวแรกก่อน เกินโควต้าค่อยสลับ)
     ถ้าเผลอใส่ key ไว้ใน <PREFIX>_FALLBACK_MODELS จะย้ายไปเป็น key สำรองให้อัตโนมัติ
@@ -55,7 +66,11 @@ def _provider_settings(
         raise ConfigError(f"ไม่พบ {prefix}_MODEL ใน .env (จำเป็นเพราะตั้ง {var}={provider})")
     if looks_like_secret(model):
         raise ConfigError(f"{prefix}_MODEL ต้องเป็นชื่อโมเดล ไม่ใช่ API key")
-    return tuple(dict.fromkeys(keys)), model, tuple(fallback_models)
+    # โมเดลที่ใช้เมื่อคำถามมีรูป (ไม่ใส่ = ใช้โมเดลปกติ) เช่น โมเดลฟรีของ OpenRouter ที่อ่านรูปได้
+    vision_model = os.getenv(f"{prefix}_VISION_MODEL", "").strip()
+    return ProviderSettings(
+        provider, tuple(dict.fromkeys(keys)), model, tuple(fallback_models), vision_model
+    )
 
 
 def _has_provider(provider: str) -> bool:
@@ -100,16 +115,15 @@ class Config:
     discord_token: str
     guild_id: int | None
     ai_channel_ids: tuple[int, ...]
+    log_channel_id: int | None
     data_dir: Path
     provider: str
     api_keys: tuple[str, ...]
     model: str
     fallback_models: tuple[str, ...]
-    # ผู้ให้บริการสำรอง ใช้เมื่อตัวหลักเกินโควต้า/ล่ม (None = ไม่มี)
-    backup_provider: str | None
-    backup_api_keys: tuple[str, ...]
-    backup_model: str
-    backup_fallback_models: tuple[str, ...]
+    vision_model: str
+    # ผู้ให้บริการสำรอง เรียงตามลำดับที่จะลอง เมื่อตัวหลักเกินโควต้า/ล่ม (ว่าง = ไม่มี)
+    backups: tuple[ProviderSettings, ...]
     max_retries: int
     warnings: tuple[str, ...]  # ข้อความเตือนเรื่องการตั้งค่า ให้ main แสดงตอนเริ่มบอท
     system_prompt: str
@@ -127,6 +141,15 @@ class Config:
     ai_timeout: float
     temperature: float
 
+    @property
+    def backup_provider(self) -> str | None:
+        """ชื่อผู้ให้บริการสำรองทั้งหมด (ไว้แสดงผล) เช่น "groq, openrouter" """
+        return ", ".join(b.provider for b in self.backups) or None
+
+    @property
+    def backup_summary(self) -> str:
+        return ", ".join(f"{b.provider}/{b.model}" for b in self.backups) or "-"
+
     @classmethod
     def load(cls) -> "Config":
         token = os.getenv("DISCORD_TOKEN", "").strip()
@@ -135,29 +158,24 @@ class Config:
 
         provider = os.getenv("AI_PROVIDER", "gemini").strip().lower()
         warnings: list[str] = []
-        api_keys, model, fallback_models = _provider_settings(provider, "AI_PROVIDER", warnings)
+        primary = _provider_settings(provider, "AI_PROVIDER", warnings)
 
-        # BACKUP_PROVIDER: ว่าง/auto = เลือกเจ้าที่มี key + โมเดลครบให้เอง, none = ไม่ใช้ตัวสำรอง
+        # BACKUP_PROVIDER: ใส่ได้หลายเจ้า คั่นด้วยจุลภาค (ลองตามลำดับ) เช่น groq,openrouter
+        # ว่าง/auto = ใช้ทุกเจ้าที่กรอก key + โมเดลไว้, none = ไม่ใช้ตัวสำรอง
         backup_raw = os.getenv("BACKUP_PROVIDER", "").strip().lower()
-        backup_provider: str | None
         if backup_raw in ("", "auto"):
-            backup_provider = next(
-                (p for p in SUPPORTED_PROVIDERS if p != provider and _has_provider(p)), None
-            )
-            if backup_provider:
-                warnings.append(f"ใช้ {backup_provider} เป็นตัวสำรองอัตโนมัติ (ปิดได้ด้วย BACKUP_PROVIDER=none)")
+            backup_names = [p for p in SUPPORTED_PROVIDERS if p != provider and _has_provider(p)]
+            if backup_names:
+                warnings.append(
+                    f"ใช้ {', '.join(backup_names)} เป็นตัวสำรองอัตโนมัติ (ปิดได้ด้วย BACKUP_PROVIDER=none)"
+                )
         elif backup_raw in ("none", "off", "false"):
-            backup_provider = None
+            backup_names = []
         else:
-            backup_provider = backup_raw
-        if backup_provider == provider:
+            backup_names = list(dict.fromkeys(_split(backup_raw)))
+        if provider in backup_names:
             raise ConfigError("BACKUP_PROVIDER ต้องไม่ซ้ำกับ AI_PROVIDER")
-        backup_api_keys: tuple[str, ...] = ()
-        backup_model, backup_fallback_models = "", ()
-        if backup_provider:
-            backup_api_keys, backup_model, backup_fallback_models = _provider_settings(
-                backup_provider, "BACKUP_PROVIDER", warnings
-            )
+        backups = tuple(_provider_settings(b, "BACKUP_PROVIDER", warnings) for b in backup_names)
 
         try:
             ai_channel_ids = tuple(
@@ -182,15 +200,14 @@ class Config:
             discord_token=token,
             guild_id=guild_id,
             ai_channel_ids=ai_channel_ids,
+            log_channel_id=_get_int("LOG_CHANNEL_ID", 0) or None,
             data_dir=Path(os.getenv("DATA_DIR", "data").strip() or "data"),
             provider=provider,
-            api_keys=api_keys,
-            model=model,
-            fallback_models=fallback_models,
-            backup_provider=backup_provider,
-            backup_api_keys=backup_api_keys,
-            backup_model=backup_model,
-            backup_fallback_models=backup_fallback_models,
+            api_keys=primary.api_keys,
+            model=primary.model,
+            fallback_models=primary.fallback_models,
+            vision_model=primary.vision_model,
+            backups=backups,
             max_retries=min(5, max(0, _get_int("AI_MAX_RETRIES", 2))),
             warnings=tuple(warnings),
             system_prompt=os.getenv(
