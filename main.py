@@ -67,6 +67,7 @@ class AIChatBot(discord.Client):
         )
         self.ai: AIProvider | BackupProvider = create_provider(config)
         self.answer_count = 0
+        self._cleaned_commands = False
         self._statuses = itertools.cycle(self._status_texts())
         self._register_commands()
 
@@ -90,6 +91,39 @@ class AIChatBot(discord.Client):
             f"{self.config.backup_provider}/{self.config.backup_model}"
             if self.config.backup_provider else "-",
         )
+        if not self._cleaned_commands:
+            self._cleaned_commands = True
+            await self._remove_stale_commands()
+
+    async def _remove_stale_commands(self) -> None:
+        """ลบคำสั่ง slash ที่ค้างอยู่ใน Discord แต่ไม่ได้มาจากโค้ดนี้
+
+        เช่น คำสั่งจากโปรแกรมอื่นที่เคยใช้ token เดียวกัน หรือคำสั่ง global เก่าตอนยังไม่ได้ตั้ง GUILD_ID
+        ซึ่งทำให้คำสั่งขึ้นซ้ำ 2 อัน — บอทนี้เป็นเจ้าของแอปทั้งหมด จึงเหลือไว้แค่คำสั่งของตัวเอง
+        """
+        app_id = self.application_id
+        if app_id is None:
+            return
+        target = self.config.guild_id
+        # ตั้ง GUILD_ID = คำสั่งอยู่เฉพาะเซิร์ฟเวอร์นั้น → ฝั่ง global ต้องว่าง
+        scopes: list[discord.Guild | None] = [None] if target else []
+        # เซิร์ฟเวอร์อื่น ๆ (หรือทุกเซิร์ฟเวอร์ถ้าใช้แบบ global) ต้องไม่มีคำสั่งระดับเซิร์ฟเวอร์ค้าง
+        scopes += [g for g in self.guilds if g.id != target]
+        for scope in scopes:
+            where = "global" if scope is None else f"เซิร์ฟเวอร์ {scope.name}"
+            try:
+                stale = await self.tree.fetch_commands(guild=scope)
+                if not stale:
+                    continue
+                if scope is None:
+                    await self.http.bulk_upsert_global_commands(app_id, [])
+                else:
+                    await self.http.bulk_upsert_guild_commands(app_id, scope.id, [])
+                log.info(
+                    "ลบคำสั่งที่ค้าง (%s): %s", where, ", ".join(f"/{c.name}" for c in stale)
+                )
+            except discord.HTTPException as e:
+                log.warning("ลบคำสั่งที่ค้าง (%s) ไม่สำเร็จ: %r", where, e)
 
     def _status_texts(self) -> list[Callable[[], str]]:
         texts: list[Callable[[], str]] = [
