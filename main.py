@@ -12,6 +12,7 @@ import sys
 import discord
 from discord import app_commands
 
+from bot.channels import AIChannelStore
 from bot.config import Config, ConfigError
 from bot.cooldown import UserCooldown
 from bot.memory import ChannelMemory
@@ -42,6 +43,9 @@ class AIChatBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.memory = ChannelMemory(config.memory_size)
         self.cooldown = UserCooldown(config.user_cooldown)
+        self.ai_channels = AIChannelStore(
+            config.ai_channel_ids, config.data_dir / "ai_channels.json"
+        )
         self.ai: AIProvider = create_provider(config)
         self._register_commands()
 
@@ -95,18 +99,34 @@ class AIChatBot(discord.Client):
             return f"🕒 ใจเย็น ๆ นะ รออีก {remaining:.0f} วินาทีแล้วค่อยถามใหม่"
         return None
 
-    # ---------- mention ----------
+    # ---------- mention / ห้องคุยกับ AI ----------
+
+    def _in_ai_channel(self, channel: discord.abc.Messageable) -> bool:
+        if self.ai_channels.is_ai_channel(getattr(channel, "id", 0)):
+            return True
+        # เธรดที่แตกออกจากห้องคุยกับ AI ก็ตอบอัตโนมัติด้วย (ความจำแยกตามเธรด)
+        return isinstance(channel, discord.Thread) and self.ai_channels.is_ai_channel(
+            channel.parent_id
+        )
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or self.user is None:
             return
-        if self.user not in message.mentions:
+        # ข้ามข้อความระบบ เช่น ปักหมุด, มีคนเข้าเซิร์ฟเวอร์
+        if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+            return
+
+        in_ai_channel = self._in_ai_channel(message.channel)
+        mentioned = self.user in message.mentions
+        if not (in_ai_channel or mentioned):
             return
 
         # ตัด mention ของบอทออกจากข้อความ
         question = re.sub(rf"<@!?{self.user.id}>", "", message.content).strip()
         if not question:
-            await message.reply("สวัสดี! พิมพ์คำถามต่อจากการ mention ได้เลย หรือใช้ `/ask` ก็ได้ 😊")
+            # ในห้องคุยกับ AI ข้อความที่มีแต่รูป/สติกเกอร์ ให้ข้ามไปเงียบ ๆ
+            if not in_ai_channel:
+                await message.reply("สวัสดี! พิมพ์คำถามต่อจากการ mention ได้เลย หรือใช้ `/ask` ก็ได้ 😊")
             return
 
         if wait_msg := self._cooldown_message(message.author.id):
@@ -158,6 +178,60 @@ class AIChatBot(discord.Client):
             channel_id = interaction.channel_id or interaction.user.id
             self.memory.reset(channel_id)
             await interaction.response.send_message("🧹 ล้างความจำของช่องนี้แล้ว เริ่มคุยใหม่ได้เลย!")
+
+        @self.tree.command(
+            name="aichannel", description="ตั้งห้องนี้เป็นห้องคุยกับ AI (บอทตอบทุกข้อความ ไม่ต้อง /ask)"
+        )
+        @app_commands.describe(mode="เปิด / ปิด / ดูสถานะ")
+        @app_commands.choices(
+            mode=[
+                app_commands.Choice(name="เปิด — บอทตอบทุกข้อความในห้องนี้", value="on"),
+                app_commands.Choice(name="ปิด — กลับไปใช้ /ask หรือ mention", value="off"),
+                app_commands.Choice(name="สถานะ — ดูว่าห้องไหนเปิดอยู่", value="status"),
+            ]
+        )
+        @app_commands.guild_only()
+        # ค่าเริ่มต้น: เฉพาะคนที่มีสิทธิ์ Manage Channels เห็นคำสั่งนี้
+        # (แอดมินปรับได้ที่ Server Settings → Integrations)
+        @app_commands.default_permissions(manage_channels=True)
+        async def aichannel(
+            interaction: discord.Interaction, mode: app_commands.Choice[str]
+        ) -> None:
+            channel_id = interaction.channel_id
+            if channel_id is None:
+                await interaction.response.send_message("ใช้คำสั่งนี้ในห้องของเซิร์ฟเวอร์เท่านั้น", ephemeral=True)
+                return
+
+            if mode.value == "on":
+                self.ai_channels.enable(channel_id)
+                await interaction.response.send_message(
+                    "✅ ตั้งห้องนี้เป็น **ห้องคุยกับ AI** แล้ว พิมพ์คุยได้เลย ไม่ต้องใช้ `/ask` 💬\n"
+                    "ใช้ `/reset` เพื่อล้างความจำ หรือ `/aichannel ปิด` เพื่อยกเลิก"
+                )
+            elif mode.value == "off":
+                if self.ai_channels.is_fixed(channel_id):
+                    await interaction.response.send_message(
+                        "⚠️ ห้องนี้ถูกตั้งไว้ใน `AI_CHANNEL_IDS` ของไฟล์ .env "
+                        "ต้องลบ ID ออกจากไฟล์นั้นแล้วรีสตาร์ทบอท",
+                        ephemeral=True,
+                    )
+                    return
+                self.ai_channels.disable(channel_id)
+                await interaction.response.send_message(
+                    "⏹️ ปิดห้องคุยกับ AI แล้ว ห้องนี้กลับไปใช้ `/ask` หรือ mention บอทเหมือนเดิม"
+                )
+            else:
+                guild = interaction.guild
+                mine = sorted(
+                    cid for cid in self.ai_channels.all_ids()
+                    if guild is None or guild.get_channel_or_thread(cid) is not None
+                )
+                listing = "\n".join(f"• <#{cid}>" for cid in mine) or "ยังไม่มี"
+                here = "✅ เปิดอยู่" if self._in_ai_channel(interaction.channel) else "❌ ปิดอยู่"
+                await interaction.response.send_message(
+                    f"ห้องนี้: {here}\n**ห้องคุยกับ AI ในเซิร์ฟเวอร์นี้:**\n{listing}",
+                    ephemeral=True,
+                )
 
         @self.tree.error
         async def on_app_command_error(

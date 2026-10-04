@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# ข้อมูลที่บอทสร้างขณะรัน
+data/
+
 # Python
 __pycache__/
 *.py[cod]

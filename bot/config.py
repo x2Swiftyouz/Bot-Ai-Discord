@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -40,6 +41,8 @@ def _get_float(name: str, default: float) -> float:
 class Config:
     discord_token: str
     guild_id: int | None
+    ai_channel_ids: tuple[int, ...]
+    data_dir: Path
     provider: str
     api_key: str
     model: str
@@ -75,12 +78,21 @@ class Config:
             m.strip() for m in os.getenv(f"{prefix}_FALLBACK_MODELS", "").split(",") if m.strip()
         )
 
+        try:
+            ai_channel_ids = tuple(
+                int(x) for x in os.getenv("AI_CHANNEL_IDS", "").replace(" ", "").split(",") if x
+            )
+        except ValueError as e:
+            raise ConfigError("AI_CHANNEL_IDS ต้องเป็นตัวเลข ID ช่อง คั่นด้วยจุลภาค") from e
+
         guild_raw = os.getenv("GUILD_ID", "").strip()
         guild_id = _get_int("GUILD_ID", 0) if guild_raw else None
 
         return cls(
             discord_token=token,
             guild_id=guild_id,
+            ai_channel_ids=ai_channel_ids,
+            data_dir=Path(os.getenv("DATA_DIR", "data").strip() or "data"),
             provider=provider,
             api_key=api_key,
             model=model,
