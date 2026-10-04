@@ -35,7 +35,7 @@ from bot.providers import (
 from bot.search import SearchError, TavilySearch, format_results, is_video_query, should_search
 from bot.storage import Database
 from bot.streaming import StreamPreview
-from bot.utils import now_text, redact, split_message, tables_to_lists
+from bot.utils import now_text, redact, split_message, suppress_link_previews, tables_to_lists
 from bot.views import AnswerContext, AnswerView, CloseThreadView
 
 logging.basicConfig(
@@ -305,6 +305,7 @@ class AIChatBot(discord.Client):
             history = self.memory.get(ctx.channel_id) if ctx.use_memory else []
             started = time.monotonic()
             sources: tuple[tuple[str, str], ...] = ()
+            video_search = False
             if self.search and ctx.search_query and should_search(ctx.search_query):
                 # คำถามก่อนหน้าของห้อง (ตัดชื่อผู้ถามออก) ไว้เติมหัวข้อให้คำค้นที่สั้นเกินไป
                 previous = next((m.content for m in reversed(history) if m.role == "user"), "")
@@ -318,7 +319,8 @@ class AIChatBot(discord.Client):
                 if found:
                     prompt += "\n\n" + format_results(found, now_text(self.config.timezone))
                     sources = tuple((r.title, r.url) for r in found)
-                    if is_video_query(ctx.search_query):
+                    video_search = is_video_query(ctx.search_query)
+                    if video_search:
                         # AI มักบอกแค่ชื่อคลิป บอทจึงต่อท้ายลิงก์ให้กดได้เลย (<> กันพรีวิวใหญ่ท่วมห้อง)
                         links = "\n".join(
                             f"{i}. [{r.title[:80]}](<{r.url}>)"
@@ -337,6 +339,8 @@ class AIChatBot(discord.Client):
             else:
                 if sources:
                     result = replace(result, sources=sources, searched=True)
+                if ctx.extras and re.search(r"youtube\.com|youtu\.be|tiktok\.com", result.text):
+                    ctx.extras = ""  # AI ใส่ลิงก์คลิปในคำตอบเองแล้ว ไม่ต้องต่อท้ายซ้ำ
                 ctx.ok, ctx.answer = True, result.text
                 if ctx.use_memory:
                     self.memory.add_exchange(ctx.channel_id, ctx.prompt, result.text)
@@ -350,8 +354,8 @@ class AIChatBot(discord.Client):
             elapsed=elapsed,
         )
         if ctx.ok:
-            # มีรายการคลิปแล้ว ไม่ต้องแสดงแหล่งที่มาซ้ำ
-            shown = replace(result, sources=()) if ctx.extras else result
+            # ค้นคลิป: ลิงก์อยู่ในคำตอบหรือรายการ 🎬 แล้ว ไม่ต้องแสดงแหล่งที่มาซ้ำ
+            shown = replace(result, sources=()) if video_search else result
             ctx.footer = self._footer(shown, elapsed, self._remaining(ctx))
 
     def _remaining(self, ctx: AnswerContext) -> int | None:
@@ -405,7 +409,7 @@ class AIChatBot(discord.Client):
         ตาราง Markdown ถูกแปลงเป็นรายการ เพราะ Discord แสดงตารางไม่ได้ (ไฟล์แนบเก็บตารางเดิมไว้)
         """
         footer = f"\n{ctx.footer}" if ctx.footer else ""
-        answer = tables_to_lists(ctx.answer)
+        answer = suppress_link_previews(tables_to_lists(ctx.answer))
         limit = self.config.long_answer_file_chars
         if allow_file and ctx.ok and limit and len(answer) > limit:
             preview = split_message(answer, LONG_ANSWER_PREVIEW)[0]
