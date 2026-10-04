@@ -304,8 +304,11 @@ class AIChatBot(discord.Client):
             started = time.monotonic()
             sources: tuple[tuple[str, str], ...] = ()
             if self.search and ctx.search_query and should_search(ctx.search_query):
+                # คำถามก่อนหน้าของห้อง (ตัดชื่อผู้ถามออก) ไว้เติมหัวข้อให้คำค้นที่สั้นเกินไป
+                previous = next((m.content for m in reversed(history) if m.role == "user"), "")
+                previous = previous.split(": ", 1)[-1].split(" [แนบ", 1)[0]
                 try:
-                    found = await self.search.search(ctx.search_query)
+                    found = await self.search.search(ctx.search_query, previous)
                 except SearchError as e:
                     log.warning("ค้นเว็บไม่สำเร็จ ตอบแบบไม่ค้นเว็บแทน: %s", e)
                     self.admin_log.post(f"🔎 ค้นเว็บ (Tavily) ไม่สำเร็จ: `{e}`", key="tavily")
