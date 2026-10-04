@@ -2,7 +2,25 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 DISCORD_LIMIT = 2000
+
+_THAI_DAYS = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
+_THAI_MONTHS = [
+    "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
+    "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม",
+]
+
+
+def now_text(timezone: str, now: datetime | None = None) -> str:
+    """วันเวลาปัจจุบันเป็นภาษาไทย เช่น "วันอาทิตย์ที่ 4 ตุลาคม ค.ศ. 2026 (พ.ศ. 2569) เวลา 08:05 น. (Asia/Bangkok)" """
+    now = now or datetime.now(ZoneInfo(timezone))
+    return (
+        f"วัน{_THAI_DAYS[now.weekday()]}ที่ {now.day} {_THAI_MONTHS[now.month - 1]} "
+        f"ค.ศ. {now.year} (พ.ศ. {now.year + 543}) เวลา {now:%H:%M} น. ({timezone})"
+    )
 FENCE = "```"
 
 
