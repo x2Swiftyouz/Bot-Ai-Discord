@@ -55,9 +55,10 @@ class AIError(Exception):
 class RateLimitError(AIError):
     user_message = "⏳ ตอนนี้มีคนใช้เยอะจนเกินโควต้าฟรีของ AI (HTTP 429) รอสักครู่แล้วลองใหม่นะ"
 
-    def __init__(self, retry_after: float | None = None) -> None:
+    def __init__(self, retry_after: float | None = None, body: str = "") -> None:
         super().__init__("rate limited")
         self.retry_after = retry_after
+        self.body = body
         if retry_after:
             self.user_message += f" (ประมาณ {int(retry_after) + 1} วินาที)"
 
@@ -98,7 +99,7 @@ class AIProvider(ABC):
     name: str = "base"
 
     def __init__(self, config: Config) -> None:
-        self.api_key = config.api_key
+        self.api_keys = config.api_keys
         self.model = config.model
         # ลองโมเดลหลักก่อน ถ้าล่ม/เกินโควต้า/ถูกถอด ค่อยไล่ลองโมเดลสำรองตามลำดับ
         self.models = list(dict.fromkeys((config.model, *config.fallback_models)))
@@ -109,6 +110,10 @@ class AIProvider(ABC):
         self.web_search = config.web_search
         self._timeout = aiohttp.ClientTimeout(total=config.ai_timeout)
         self._session: aiohttp.ClientSession | None = None
+        # (ลำดับ key, โมเดล) ที่เกินโควต้า -> เวลาที่จะลองใช้ได้อีก
+        self._key_paused_until: dict[tuple[int, str], float] = {}
+
+    KEY_PAUSE_SECONDS = 60
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -126,10 +131,9 @@ class AIProvider(ABC):
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status == 429:
                     # ข้อความใน body บอกว่าโควต้าตัวไหนหมด (ต่อนาที / ต่อวัน / ค้นเว็บ)
-                    log.warning(
-                        "%s HTTP 429 (model %s): %s", self.name, model, (await resp.text())[:800]
-                    )
-                    raise RateLimitError(_parse_retry_after(resp.headers))
+                    body = await resp.text()
+                    log.warning("%s HTTP 429 (model %s): %s", self.name, model, body[:800])
+                    raise RateLimitError(_parse_retry_after(resp.headers), body)
                 if resp.status in (401, 403):
                     log.error("%s auth error %s: %s", self.name, resp.status, await resp.text())
                     raise AuthError(f"HTTP {resp.status}")
@@ -176,16 +180,30 @@ class AIProvider(ABC):
         """
         last_error: AIError | None = None
         for model in self.models:
-            for attempt in range(self.max_retries + 1):
+            now = time.monotonic()
+            keys = [
+                (no, key) for no, key in enumerate(self.api_keys)
+                if self._key_paused_until.get((no, model), 0) <= now
+            ]
+            if not keys:
+                last_error = last_error or RateLimitError()
+            for no, key in keys:
                 try:
-                    return await self._generate(model, history, prompt, images)
-                except ServiceUnavailableError as e:
+                    return await self._generate_with_retry(model, no, key, history, prompt, images)
+                except RateLimitError as e:
+                    # key นี้เกินโควต้า → พักไว้ แล้วลอง key ถัดไป (key จากคนละโปรเจกต์ได้โควต้าแยกกัน)
                     last_error = e
-                    if attempt < self.max_retries:
-                        delay = 2**attempt
-                        log.info("%s %s busy, retrying in %ss", self.name, model, delay)
-                        await asyncio.sleep(delay)
-                except (RateLimitError, ModelNotFoundError) as e:
+                    pause = max(e.retry_after or 0, self.KEY_PAUSE_SECONDS)
+                    self._key_paused_until[(no, model)] = time.monotonic() + pause
+                    if len(self.api_keys) > 1:
+                        log.warning("%s key #%d เกินโควต้าของ %s พักไว้ %.0f วินาที",
+                                    self.name, no + 1, model, pause)
+                except AuthError as e:
+                    # key ผิด/ถูกลบ → ถ้ามี key อื่นก็ลองต่อ
+                    last_error = e
+                    log.error("%s key #%d ใช้ไม่ได้ (key ผิดหรือถูกลบ)", self.name, no + 1)
+                except (ServiceUnavailableError, ModelNotFoundError) as e:
+                    # ปัญหาที่ตัวโมเดล ไม่เกี่ยวกับ key → ข้ามไปโมเดลถัดไป
                     last_error = e
                     break
             if model != self.models[-1]:
@@ -193,10 +211,32 @@ class AIProvider(ABC):
         assert last_error is not None
         raise last_error
 
+    async def _generate_with_retry(
+        self,
+        model: str,
+        key_no: int,
+        key: str,
+        history: list[ChatMessage],
+        prompt: str,
+        images: Sequence[ImageData],
+    ) -> AIResult:
+        """เรียก API ด้วยโมเดล + key ที่กำหนด ถ้าเซิร์ฟเวอร์ล่ม (5xx) ลองซ้ำโดยรอ 1, 2, 4 ... วินาที"""
+        for attempt in range(self.max_retries + 1):
+            try:
+                return await self._generate(model, key, history, prompt, images)
+            except ServiceUnavailableError:
+                if attempt >= self.max_retries:
+                    raise
+                delay = 2**attempt
+                log.info("%s %s busy, retrying in %ss", self.name, model, delay)
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
+
     @abstractmethod
     async def _generate(
         self,
         model: str,
+        api_key: str,
         history: list[ChatMessage],
         prompt: str,
         images: Sequence[ImageData],
@@ -209,6 +249,8 @@ class GeminiProvider(AIProvider):
     BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
     # โดน 429 ตอนค้นเว็บ → พักการค้นเว็บของโมเดลนั้นกี่วินาที
     SEARCH_PAUSE_SECONDS = 30 * 60
+    # ถ้าตอบแบบไม่ค้นเว็บได้ แปลว่าโควต้า "ค้นเว็บ" หมดโดยเฉพาะ (หรือ free tier ไม่มีให้) → พักนานขึ้น
+    SEARCH_QUOTA_PAUSE_SECONDS = 6 * 60 * 60
     # ถ้าไม่บอก Gemini มักไม่ค้นเอง และตอบว่า "เข้าถึงข้อมูลเรียลไทม์ไม่ได้"
     SEARCH_HINT = (
         "คุณมีเครื่องมือ Google Search ใช้ค้นข้อมูลล่าสุดได้ "
@@ -232,6 +274,7 @@ class GeminiProvider(AIProvider):
     async def _generate(
         self,
         model: str,
+        api_key: str,
         history: list[ChatMessage],
         prompt: str,
         images: Sequence[ImageData],
@@ -269,7 +312,7 @@ class GeminiProvider(AIProvider):
 
         url = f"{self.BASE_URL}/{model}:generateContent"
         # ส่ง key ทาง header แทน query string เพื่อไม่ให้ key หลุดไปใน log ของ URL
-        headers = {"x-goog-api-key": self.api_key}
+        headers = {"x-goog-api-key": api_key}
         try:
             data = await self._post_json(url, payload, headers, model)
         except BadRequestError:
@@ -289,6 +332,13 @@ class GeminiProvider(AIProvider):
             self._search_paused_until[model] = time.monotonic() + self.SEARCH_PAUSE_SECONDS
             without_search()
             data = await self._post_json(url, payload, headers, model)
+            hours = self.SEARCH_QUOTA_PAUSE_SECONDS // 3600
+            log.warning(
+                "Gemini %s ตอบได้เมื่อไม่ค้นเว็บ → โควต้าค้นเว็บหมด (หรือ free tier ไม่มีให้) "
+                "พักการค้นเว็บ %s ชั่วโมง — ถ้าเป็นแบบนี้ทุกวัน ให้ตั้ง WEB_SEARCH=false",
+                model, hours,
+            )
+            self._search_paused_until[model] = time.monotonic() + self.SEARCH_QUOTA_PAUSE_SECONDS
 
         if block := data.get("promptFeedback", {}).get("blockReason"):
             log.warning("Gemini blocked prompt: %s", block)
@@ -329,6 +379,7 @@ class OpenAICompatibleProvider(AIProvider):
     async def _generate(
         self,
         model: str,
+        api_key: str,
         history: list[ChatMessage],
         prompt: str,
         images: Sequence[ImageData],
@@ -352,7 +403,7 @@ class OpenAICompatibleProvider(AIProvider):
         data = await self._post_json(
             self.url,
             {"model": model, "messages": messages, "temperature": self.temperature},
-            {"Authorization": f"Bearer {self.api_key}", **self.extra_headers()},
+            {"Authorization": f"Bearer {api_key}", **self.extra_headers()},
             model,
         )
 
@@ -447,7 +498,7 @@ def create_provider(config: Config) -> AIProvider | BackupProvider:
     backup_config = replace(
         config,
         provider=config.backup_provider,
-        api_key=config.backup_api_key,
+        api_keys=config.backup_api_keys,
         model=config.backup_model,
         fallback_models=config.backup_fallback_models,
     )

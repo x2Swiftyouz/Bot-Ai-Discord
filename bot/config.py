@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
+from .utils import looks_like_secret
+
 load_dotenv()
 
 SUPPORTED_PROVIDERS = ("gemini", "groq", "openrouter")
@@ -18,21 +20,48 @@ class ConfigError(Exception):
     pass
 
 
-def _provider_settings(provider: str, var: str) -> tuple[str, str, tuple[str, ...]]:
-    """อ่าน (API key, โมเดล, โมเดลสำรอง) ของผู้ให้บริการ AI จาก .env"""
+def _split(value: str) -> list[str]:
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def _provider_settings(
+    provider: str, var: str, warnings: list[str]
+) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
+    """อ่าน (API key ทั้งหมด, โมเดล, โมเดลสำรอง) ของผู้ให้บริการ AI จาก .env
+
+    key หลายตัว: ใส่ใน <PREFIX>_API_KEYS คั่นด้วยจุลภาค (ใช้ตัวแรกก่อน เกินโควต้าค่อยสลับ)
+    ถ้าเผลอใส่ key ไว้ใน <PREFIX>_FALLBACK_MODELS จะย้ายไปเป็น key สำรองให้อัตโนมัติ
+    """
     if provider not in SUPPORTED_PROVIDERS:
         raise ConfigError(f"{var}={provider!r} ไม่รองรับ ใช้ได้: {', '.join(SUPPORTED_PROVIDERS)}")
     prefix = provider.upper()
-    api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
+    keys = _split(os.getenv(f"{prefix}_API_KEY", "")) + _split(os.getenv(f"{prefix}_API_KEYS", ""))
     model = os.getenv(f"{prefix}_MODEL", "").strip()
-    if not api_key:
+
+    fallback_models: list[str] = []
+    for item in _split(os.getenv(f"{prefix}_FALLBACK_MODELS", "")):
+        if looks_like_secret(item):
+            keys.append(item)
+            warnings.append(
+                f"{prefix}_FALLBACK_MODELS มี API key ปนอยู่ (ช่องนี้ต้องเป็นชื่อโมเดล) "
+                f"— ย้ายไปใช้เป็น key สำรองให้แล้ว ควรย้ายไปไว้ที่ {prefix}_API_KEYS แทน"
+            )
+        else:
+            fallback_models.append(item)
+
+    if not keys:
         raise ConfigError(f"ไม่พบ {prefix}_API_KEY ใน .env (จำเป็นเพราะตั้ง {var}={provider})")
     if not model:
         raise ConfigError(f"ไม่พบ {prefix}_MODEL ใน .env (จำเป็นเพราะตั้ง {var}={provider})")
-    fallback_models = tuple(
-        m.strip() for m in os.getenv(f"{prefix}_FALLBACK_MODELS", "").split(",") if m.strip()
-    )
-    return api_key, model, fallback_models
+    if looks_like_secret(model):
+        raise ConfigError(f"{prefix}_MODEL ต้องเป็นชื่อโมเดล ไม่ใช่ API key")
+    return tuple(dict.fromkeys(keys)), model, tuple(fallback_models)
+
+
+def _has_provider(provider: str) -> bool:
+    prefix = provider.upper()
+    has_key = os.getenv(f"{prefix}_API_KEY", "").strip() or os.getenv(f"{prefix}_API_KEYS", "").strip()
+    return bool(has_key and os.getenv(f"{prefix}_MODEL", "").strip())
 
 
 def _get_int(name: str, default: int) -> int:
@@ -73,15 +102,16 @@ class Config:
     ai_channel_ids: tuple[int, ...]
     data_dir: Path
     provider: str
-    api_key: str
+    api_keys: tuple[str, ...]
     model: str
     fallback_models: tuple[str, ...]
     # ผู้ให้บริการสำรอง ใช้เมื่อตัวหลักเกินโควต้า/ล่ม (None = ไม่มี)
     backup_provider: str | None
-    backup_api_key: str
+    backup_api_keys: tuple[str, ...]
     backup_model: str
     backup_fallback_models: tuple[str, ...]
     max_retries: int
+    warnings: tuple[str, ...]  # ข้อความเตือนเรื่องการตั้งค่า ให้ main แสดงตอนเริ่มบอท
     system_prompt: str
     timezone: str
     web_search: bool
@@ -100,15 +130,29 @@ class Config:
             raise ConfigError("ไม่พบ DISCORD_TOKEN ใน .env")
 
         provider = os.getenv("AI_PROVIDER", "gemini").strip().lower()
-        api_key, model, fallback_models = _provider_settings(provider, "AI_PROVIDER")
+        warnings: list[str] = []
+        api_keys, model, fallback_models = _provider_settings(provider, "AI_PROVIDER", warnings)
 
-        backup_provider = os.getenv("BACKUP_PROVIDER", "").strip().lower() or None
-        backup_api_key, backup_model, backup_fallback_models = "", "", ()
+        # BACKUP_PROVIDER: ว่าง/auto = เลือกเจ้าที่มี key + โมเดลครบให้เอง, none = ไม่ใช้ตัวสำรอง
+        backup_raw = os.getenv("BACKUP_PROVIDER", "").strip().lower()
+        backup_provider: str | None
+        if backup_raw in ("", "auto"):
+            backup_provider = next(
+                (p for p in SUPPORTED_PROVIDERS if p != provider and _has_provider(p)), None
+            )
+            if backup_provider:
+                warnings.append(f"ใช้ {backup_provider} เป็นตัวสำรองอัตโนมัติ (ปิดได้ด้วย BACKUP_PROVIDER=none)")
+        elif backup_raw in ("none", "off", "false"):
+            backup_provider = None
+        else:
+            backup_provider = backup_raw
         if backup_provider == provider:
             raise ConfigError("BACKUP_PROVIDER ต้องไม่ซ้ำกับ AI_PROVIDER")
+        backup_api_keys: tuple[str, ...] = ()
+        backup_model, backup_fallback_models = "", ()
         if backup_provider:
-            backup_api_key, backup_model, backup_fallback_models = _provider_settings(
-                backup_provider, "BACKUP_PROVIDER"
+            backup_api_keys, backup_model, backup_fallback_models = _provider_settings(
+                backup_provider, "BACKUP_PROVIDER", warnings
             )
 
         try:
@@ -136,14 +180,15 @@ class Config:
             ai_channel_ids=ai_channel_ids,
             data_dir=Path(os.getenv("DATA_DIR", "data").strip() or "data"),
             provider=provider,
-            api_key=api_key,
+            api_keys=api_keys,
             model=model,
             fallback_models=fallback_models,
             backup_provider=backup_provider,
-            backup_api_key=backup_api_key,
+            backup_api_keys=backup_api_keys,
             backup_model=backup_model,
             backup_fallback_models=backup_fallback_models,
             max_retries=min(5, max(0, _get_int("AI_MAX_RETRIES", 2))),
+            warnings=tuple(warnings),
             system_prompt=os.getenv(
                 "SYSTEM_PROMPT", "You are a helpful assistant on Discord."
             ).strip(),

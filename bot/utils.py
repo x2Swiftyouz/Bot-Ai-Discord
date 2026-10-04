@@ -2,10 +2,30 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 DISCORD_LIMIT = 2000
+
+# รูปแบบ API key ของ Google (AIza..., AQ....), Groq (gsk_...), OpenRouter/OpenAI (sk-...)
+# และ token บอท Discord (3 ท่อนคั่นด้วยจุด)
+_SECRET_RE = re.compile(
+    r"AIza[0-9A-Za-z_\-]{20,}"
+    r"|AQ\.[0-9A-Za-z_\-]{20,}"
+    r"|gsk_[0-9A-Za-z]{20,}"
+    r"|sk-[0-9A-Za-z_\-]{20,}"
+    r"|[MNO][0-9A-Za-z_\-]{20,}\.[0-9A-Za-z_\-]{4,}\.[0-9A-Za-z_\-]{20,}"
+)
+
+
+def looks_like_secret(text: str) -> bool:
+    return bool(_SECRET_RE.fullmatch(text.strip()))
+
+
+def redact(text: str) -> str:
+    """ซ่อน API key / token ในข้อความ (ใช้กับ log)"""
+    return _SECRET_RE.sub("***", text)
 
 _THAI_DAYS = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
 _THAI_MONTHS = [
